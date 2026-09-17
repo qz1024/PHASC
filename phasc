@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+
+import os
+import subprocess
+import sys
+
+
+def print_phasc_ascii():
+    title = """
+   \033[44;37m                                                                        \033[0m
+   \033[44;37m              \033[92m ██████╗ ██╗  ██╗ █████╗ ███████╗ ██████╗              \033[0m
+   \033[44;37m              \033[92m ██╔══██╗██║  ██║██╔══██╗██╔════╝██╔════╝              \033[0m
+   \033[44;37m              \033[92m ██████╔╝███████║███████║███████╗██║                   \033[0m
+   \033[44;37m              \033[92m ██╔═══╝ ██╔══██║██╔══██║╚════██║██║                   \033[0m
+   \033[44;37m              \033[92m ██║     ██║  ██║██║  ██║███████║╚██████╗              \033[0m
+   \033[44;37m              \033[92m ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝ ╚═════╝              \033[0m
+   \033[44;37m                                                                        \033[0m
+   \033[47;32m   PHASC: Pangenome-guided Hi-C Assembly Scaffolding and Correction   \033[0m
+   """
+    print(title)
+
+
+def print_help_message():
+    help_message = """
+\033[1;33mUSAGE:\033[0m
+  \033[1mphasc\033[0m <command> [options...]
+
+\033[1;34mCOMMANDS:\033[0m
+  \033[1mpreprocess\033[0m       Map Hi-C reads with chromap, create genome-wide mcool,
+                   for downstream PHASC detection                  (preprocess.py)
+  \033[1minversion\033[0m        Detect multi-scale inversions from mcool data       (multiscale_inversion.py)
+  \033[1mtranslocation\033[0m    Detect intra-chromosomal translocations from mcool data
+                                                                  (multiscale_translocation.py)
+
+\033[1;34mEXAMPLE:\033[0m
+  phasc preprocess -r genome.fa -1 hic_R1.fq.gz -2 hic_R2.fq.gz \\
+      -o preprocess_out -p sample -t 16
+
+  phasc translocation preprocess_out/sample.mcool --output-dir TRA_results
+  phasc inversion preprocess_out/sample.mcool --outdir INV_results
+
+\033[1;34mTIPS:\033[0m
+  Use phasc <command> --help to show options for one command.
+"""
+    print(help_message)
+
+
+def main():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    if len(sys.argv) < 2 or sys.argv[1] in ["-h", "--help"]:
+        print_phasc_ascii()
+        print_help_message()
+        return
+
+    command = sys.argv[1]
+    args = sys.argv[2:]
+
+    mapping = {
+        "preprocess": [sys.executable, os.path.join(base_dir, "preprocess.py")],
+        "inversion": [sys.executable, os.path.join(base_dir, "multiscale_inversion.py")],
+        "translocation": [sys.executable, os.path.join(base_dir, "multiscale_translocation.py")],
+    }
+
+    if command not in mapping:
+        print(f"[ERROR] Unknown command: {command}\n")
+        print_help_message()
+        sys.exit(1)
+
+    result = subprocess.run(mapping[command] + args)
+    sys.exit(result.returncode)
+
+
+if __name__ == "__main__":
+    main()

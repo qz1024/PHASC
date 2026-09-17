@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Multi-resolution intra-chromosomal translocation detection for one-chromosome mcool.
+"""Multi-resolution intra-chromosomal translocation detection for mcool files.
 
 Each Hi-C resolution is one biological observation scale. Candidates detected at
 several resolutions are merged in genomic coordinates and reported as one consensus
 event, avoiding duplicate scoring of the same biological event. Multiple PLM gamma
 values remain available as an optional sensitivity analysis, but gamma is fixed to
 1.0 by default and does not increase cross-resolution confidence.
+
+Multi-chromosome mcool files are processed chromosome by chromosome.
 """
 
 from __future__ import annotations
@@ -234,21 +236,26 @@ def evenly_spaced(values: Sequence[int], count: int) -> list[int]:
     return [values[i] for i in sorted(set(indices))]
 
 
-def select_resolutions(
-    mcool_path: Path,
+def safe_path_component(text: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(text))
+    return safe or "chromosome"
+
+
+def discover_chromosomes(mcool_path: Path, resolution: int) -> list[tuple[str, int]]:
+    probe = cooler.Cooler(f"{mcool_path}::/resolutions/{resolution}")
+    return [
+        (chrom, int(probe.chromsizes.loc[chrom]))
+        for chrom in probe.chromnames
+    ]
+
+
+def select_resolutions_for_chromosome(
+    chrom_size_bp: int,
     available: Sequence[int],
     requested: Sequence[int] | None,
     max_scales: int,
     max_bins: int,
-) -> tuple[str, int, list[int]]:
-    probe = cooler.Cooler(f"{mcool_path}::/resolutions/{available[-1]}")
-    if len(probe.chromnames) != 1:
-        raise ValueError(
-            f"expected a one-chromosome mcool, found {len(probe.chromnames)} chromosomes"
-        )
-    chrom = probe.chromnames[0]
-    chrom_size_bp = int(probe.chromsizes.loc[chrom])
-
+) -> list[int]:
     if requested:
         missing = sorted(set(requested) - set(available))
         if missing:
@@ -259,7 +266,7 @@ def select_resolutions(
         if not affordable:
             affordable = [available[-1]]
         chosen = evenly_spaced(affordable, max_scales)
-    return chrom, chrom_size_bp, chosen
+    return chosen
 
 
 def interval_similarity(
@@ -393,7 +400,7 @@ def plot_consensus_report(
     matrix = _dense_matrix(clr, chrom, balance)
     positive = matrix[np.isfinite(matrix) & (matrix > 0)]
     chrom_mb = chrom_size_bp / 1_000_000.0
-    passed = consensus.loc[consensus["passed"]].copy()
+    passed = consensus.loc[consensus["passed"].astype(bool)].copy()
 
     fig, axes = plt.subplots(1, 3, figsize=(22, 7), gridspec_kw={"width_ratios": [1.2, 2.2, 1.2]})
 
@@ -514,7 +521,7 @@ def plot_local_event_reports(
     """Create one discontinuous 2x2 local Hi-C map for every passed event."""
     output_dir.mkdir(parents=True, exist_ok=True)
     written = []
-    for _, event in consensus.loc[consensus["passed"]].iterrows():
+    for _, event in consensus.loc[consensus["passed"].astype(bool)].iterrows():
         source_center = (float(event["start_bp"]) + float(event["end_bp"])) / 2.0
         partner_center = (
             float(event["partner_start_bp"]) + float(event["partner_end_bp"])
@@ -658,27 +665,29 @@ def analyze_scale(
     return resolution, gamma, nodes, edges, candidates, segments
 
 
-def run_pipeline(args: argparse.Namespace) -> tuple[pd.DataFrame, float]:
-    mcool_path = Path(args.mcool).expanduser().resolve()
-    if not mcool_path.is_file():
-        raise FileNotFoundError(mcool_path)
-
-    available = discover_resolutions(mcool_path)
-    requested = parse_number_list(args.resolutions, int)
-    gammas = parse_number_list(args.gammas, float) or [1.0]
-    chrom, chrom_size_bp, resolutions = select_resolutions(
-        mcool_path, available, requested, args.max_resolutions, args.max_bins
+def run_one_chromosome(
+    args: argparse.Namespace,
+    mcool_path: Path,
+    available: Sequence[int],
+    requested: Sequence[int] | None,
+    gammas: Sequence[float],
+    chrom: str,
+    chrom_size_bp: int,
+    output_dir: Path,
+) -> tuple[pd.DataFrame, pd.DataFrame, float]:
+    resolutions = select_resolutions_for_chromosome(
+        chrom_size_bp, available, requested, args.max_resolutions, args.max_bins
     )
     min_segment_bp = int(args.min_segment_kb * 1000)
     bridge_bp = int(args.bridge_kb * 1000)
     total_runs = len(resolutions) * len(gammas)
 
-    print(f"chromosome: {chrom} ({chrom_size_bp / 1e6:.2f} Mb)")
+    print(f"\nchromosome: {chrom} ({chrom_size_bp / 1e6:.2f} Mb)")
     print(f"resolutions: {resolutions}")
     worker_count = min(args.workers, total_runs)
     threads_per_worker = max(1, (os.cpu_count() or worker_count) // worker_count)
     print(
-        f"gammas: {gammas}; analysis runs: {total_runs}; "
+        f"gammas: {list(gammas)}; analysis runs: {total_runs}; "
         f"parallel workers: {worker_count}"
     )
     if len(resolutions) < args.max_resolutions and requested is None:
@@ -726,12 +735,12 @@ def run_pipeline(args: argparse.Namespace) -> tuple[pd.DataFrame, float]:
                 resolution, gamma, nodes, edges, candidates, segments = future.result()
             except (RuntimeError, ValueError, KeyError, OSError) as exc:
                 print(
-                    f"[{completed}/{total_runs}] resolution={resolution}, "
+                    f"[{completed}/{total_runs}] {chrom} resolution={resolution}, "
                     f"gamma={gamma:g} skipped: {exc}"
                 )
                 continue
             print(
-                f"[{completed}/{total_runs}] resolution={resolution}, gamma={gamma:g}; "
+                f"[{completed}/{total_runs}] {chrom} resolution={resolution}, gamma={gamma:g}; "
                 f"graph={nodes} nodes/{edges} edges; candidates={len(candidates)}"
             )
             frames.append(candidates)
@@ -740,7 +749,7 @@ def run_pipeline(args: argparse.Namespace) -> tuple[pd.DataFrame, float]:
             successful_resolutions.add(resolution)
 
     if successful_runs == 0:
-        raise RuntimeError("all analysis scales failed")
+        raise RuntimeError(f"all analysis scales failed for {chrom}")
 
     community_key = min(segment_tables, key=lambda key: (key[0], abs(key[1] - 1.0)))
     community_resolution, _ = community_key
@@ -748,25 +757,31 @@ def run_pipeline(args: argparse.Namespace) -> tuple[pd.DataFrame, float]:
 
     all_candidates = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=CANDIDATE_COLUMNS)
     if not all_candidates.empty:
-        all_candidates = all_candidates.sort_values(["start_bp", "end_bp", "resolution", "gamma"]).reset_index(drop=True)
+        all_candidates.insert(0, "chrom", chrom)
+        all_candidates = all_candidates.sort_values(
+            ["chrom", "start_bp", "end_bp", "resolution", "gamma"]
+        ).reset_index(drop=True)
+    else:
+        all_candidates.insert(0, "chrom", pd.Series(dtype=str))
+
     consensus = build_consensus(
-        all_candidates,
+        all_candidates.drop(columns=["chrom"], errors="ignore"),
         len(successful_resolutions),
         args.min_scale_support,
         min(args.min_resolution_support, len(successful_resolutions)),
         args.overlap_fraction,
     )
+    consensus.insert(0, "chrom", chrom)
 
-    passed = consensus.loc[consensus["passed"]]
+    passed = consensus.loc[consensus["passed"].astype(bool)]
     normalized_score = 0.0
     if chrom_size_bp > 0 and not passed.empty:
         normalized_score = passed["event_score"].sum() / (chrom_size_bp / 1e6) * 100.0
 
-    output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     candidates_path = output_dir / "per_scale_candidates.csv"
     consensus_path = output_dir / "consensus_translocations.csv"
-    report_path = output_dir / f"multiscale_report_{chrom}.png"
+    report_path = output_dir / f"multiscale_report_{safe_path_component(chrom)}.png"
     local_report_dir = output_dir / "local_hic_events"
     all_candidates.to_csv(candidates_path, index=False, float_format="%.6g")
     consensus.to_csv(consensus_path, index=False, float_format="%.6g")
@@ -799,13 +814,123 @@ def run_pipeline(args: argparse.Namespace) -> tuple[pd.DataFrame, float]:
     print(f"local Hi-C reports: {len(local_reports)}")
     print(f"normalized instability score: {normalized_score:.2f} / 100 Mb")
     print(f"results: {output_dir}")
-    return consensus, normalized_score
+    return all_candidates, consensus, normalized_score
+
+
+def run_pipeline(args: argparse.Namespace) -> tuple[pd.DataFrame, float]:
+    mcool_path = Path(args.mcool).expanduser().resolve()
+    if not mcool_path.is_file():
+        raise FileNotFoundError(mcool_path)
+
+    available = discover_resolutions(mcool_path)
+    requested = parse_number_list(args.resolutions, int)
+    gammas = parse_number_list(args.gammas, float) or [1.0]
+    chrom_records = discover_chromosomes(mcool_path, available[-1])
+    if args.chromosomes:
+        wanted = set(parse_number_list(args.chromosomes, str) or [])
+        missing = sorted(wanted - {chrom for chrom, _ in chrom_records})
+        if missing:
+            raise ValueError(f"requested chromosomes absent from mcool: {missing}")
+        chrom_records = [
+            (chrom, size) for chrom, size in chrom_records if chrom in wanted
+        ]
+    if not chrom_records:
+        raise RuntimeError("no chromosomes selected")
+
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    multi_chrom = len(chrom_records) > 1
+    print(f"chromosomes selected: {', '.join(chrom for chrom, _ in chrom_records)}")
+
+    candidate_frames = []
+    consensus_frames = []
+    score_rows = []
+    for chrom, chrom_size_bp in chrom_records:
+        chrom_output_dir = (
+            output_dir / safe_path_component(chrom)
+            if multi_chrom
+            else output_dir
+        )
+        try:
+            candidates, consensus, normalized_score = run_one_chromosome(
+                args,
+                mcool_path,
+                available,
+                requested,
+                gammas,
+                chrom,
+                chrom_size_bp,
+                chrom_output_dir,
+            )
+        except RuntimeError as exc:
+            print(f"[SKIP] {chrom}: {exc}")
+            continue
+        candidate_frames.append(candidates)
+        consensus_frames.append(consensus)
+        score_rows.append(
+            {
+                "chrom": chrom,
+                "chrom_size_bp": chrom_size_bp,
+                "consensus_events": len(consensus),
+                "passed_events": int(consensus["passed"].astype(bool).sum()) if "passed" in consensus else 0,
+                "normalized_score_per_100mb": normalized_score,
+                "output_dir": str(chrom_output_dir),
+            }
+        )
+
+    if not consensus_frames:
+        raise RuntimeError("all selected chromosomes failed")
+
+    all_candidates = pd.concat(candidate_frames, ignore_index=True)
+    all_consensus = pd.concat(consensus_frames, ignore_index=True)
+    all_consensus["event_id"] = [
+        f"TRA_{i:05d}" for i in range(1, len(all_consensus) + 1)
+    ]
+    all_candidates.to_csv(
+        output_dir / "all_chromosomes_per_scale_candidates.csv",
+        index=False,
+        float_format="%.6g",
+    )
+    all_consensus.to_csv(
+        output_dir / "all_chromosomes_consensus_translocations.csv",
+        index=False,
+        float_format="%.6g",
+    )
+    score_table = pd.DataFrame(score_rows)
+    score_table.to_csv(
+        output_dir / "chromosome_scores.csv",
+        index=False,
+        float_format="%.6g",
+    )
+
+    total_size_mb = sum(row["chrom_size_bp"] for row in score_rows) / 1e6
+    passed_mask = (
+        all_consensus["passed"].astype(bool)
+        if not all_consensus.empty
+        else pd.Series([], dtype=bool)
+    )
+    total_passed_score = all_consensus.loc[passed_mask, "event_score"].sum()
+    genome_score = (
+        float(total_passed_score) / total_size_mb * 100.0
+        if total_size_mb > 0
+        else 0.0
+    )
+    print("\nAll selected chromosomes finished.")
+    print(f"passed events: {int(passed_mask.sum())}")
+    print(f"genome-wide normalized instability score: {genome_score:.2f} / 100 Mb")
+    print(f"combined results: {output_dir}")
+    return all_consensus, genome_score
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mcool", help="one-chromosome .mcool input")
+    parser.add_argument("mcool", help="one- or multi-chromosome .mcool input")
     parser.add_argument("--output-dir", default="multiscale_translocation_results")
+    parser.add_argument(
+        "--chromosomes",
+        default=None,
+        help="comma-separated chromosome names to analyze; default analyzes all chromosomes",
+    )
     parser.add_argument("--resolutions", default="auto", help="comma-separated resolutions, or auto")
     parser.add_argument(
         "--gammas",
