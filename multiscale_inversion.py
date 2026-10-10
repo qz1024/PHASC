@@ -2699,6 +2699,11 @@ def detect_block_INV(
     s_mat=s_matrix_for_qc(hic,target,args)
     s_raw=s_mat
     lattice_max=float(getattr(args, "lattice_peak_max", 0.30))
+    # Tip oneside INVs are often one solid domain (chr3D 0-7 Mb); the
+    # lattice gate is tuned for internal checkerboards and is slightly
+    # harsh on those tip blocks (0.312 vs 0.30).
+    if edge_oneside is not None and lattice_max>0:
+        lattice_max=max(lattice_max, 0.35)
     lattice_peak=s_matrix_lattice_peak_fraction(s_mat)
     lattice_pass=1
     if lattice_max>0 and np.isfinite(lattice_peak):
@@ -3096,6 +3101,9 @@ def process_one_chrom(
         edge_oneside is set for chrom first/last parents that the main loop
         never targets: internal subs use both flanks; the sub that remains
         on the chrom end uses pure oneside on the available arm.
+
+        Always oneside-test the intact tip parent first (chr3D 0-7 Mb is one
+        Louvain community; split alone only recovered a nested 5-6 Mb core).
         """
         if (
             split_min<=0
@@ -3105,17 +3113,19 @@ def process_one_chrom(
         ):
             return
         parent=blocks[parent_index]
+        parent_inv=False
+        if edge_oneside and parent[1]-parent[0]>=args.min_block:
+            r_parent=detect_block_INV(
+                hic, blocks, parent_index, args,
+                edge_oneside=edge_oneside,
+            )
+            if r_parent and r_parent.get("INV")==1:
+                _append_inv(r_parent, secondary=0, gap_bridge=0)
+                parent_inv=True
         if parent[1]-parent[0]<split_min:
-            # Below split size: still oneside-test an edge parent itself.
-            if edge_oneside and parent[1]-parent[0]>=args.min_block:
-                _append_inv(
-                    detect_block_INV(
-                        hic, blocks, parent_index, args,
-                        edge_oneside=edge_oneside,
-                    ),
-                    secondary=0,
-                    gap_bridge=0,
-                )
+            return
+        # Intact tip already called: skip nested split (avoids short subset).
+        if parent_inv:
             return
         subs=secondary_louvain_split(
             hic,
@@ -3130,15 +3140,6 @@ def process_one_chrom(
             gap_cluster_diag_frac=gap_frac,
         )
         if len(subs)<=1:
-            if edge_oneside:
-                _append_inv(
-                    detect_block_INV(
-                        hic, blocks, parent_index, args,
-                        edge_oneside=edge_oneside,
-                    ),
-                    secondary=0,
-                    gap_bridge=0,
-                )
             return
         local=blocks[:parent_index]+subs+blocks[parent_index+1:]
         sub_hi=parent_index+len(subs)
