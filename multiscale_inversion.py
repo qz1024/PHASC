@@ -248,6 +248,18 @@ def parse_args():
 
 
     parser.add_argument(
+        "--corner_enrichment_max",
+        type=float,
+        default=5.0,
+        help=(
+            "maximum per-side diag/anti on a GCOR flank x S matrix; "
+            "rejects hyper-bright local X / tick artifacts "
+            "(default: 5.0; <=0 disables upper cap)"
+        )
+    )
+
+
+    parser.add_argument(
         "--corner_diag_bg_min",
         type=float,
         default=0.0,
@@ -265,6 +277,39 @@ def parse_args():
         help=(
             "max allowed fraction of strong secondary diagonals inside S; "
             "rejects checkerboard/repeat lattices (default: 0.30; <=0 disables)"
+        )
+    )
+
+
+    parser.add_argument(
+        "--parallel_diag_max",
+        type=float,
+        default=0.30,
+        help=(
+            "max allowed (best off-diag band mean)/(main-diag) inside S; "
+            "rejects parallel-stripe tandem/satellite (default: 0.30; <=0 disables)"
+        )
+    )
+
+
+    parser.add_argument(
+        "--offdiag_fill_max",
+        type=float,
+        default=0.25,
+        help=(
+            "max allowed mean(|i-j|>=3)/mean(1<=|i-j|<=2) inside S; rejects "
+            "blocky/grid repeat clouds (default: 0.25; <=0 disables)"
+        )
+    )
+
+
+    parser.add_argument(
+        "--s_qc_resolution",
+        type=int,
+        default=50_000,
+        help=(
+            "fetch S at this resolution (or finer detection res) for lattice/"
+            "parallel/fill QC so coarse bins still see stripes (default: 50000)"
         )
     )
 
@@ -591,6 +636,22 @@ def parse_args():
     if args.corner_enrichment_min < 0:
 
         parser.error("--corner_enrichment_min must be >= 0")
+
+
+    if args.corner_enrichment_max < 0:
+
+        parser.error("--corner_enrichment_max must be >= 0")
+
+
+    if (
+        args.corner_enrichment_max > 0
+        and args.corner_enrichment_max < args.corner_enrichment_min
+    ):
+
+        parser.error(
+            "--corner_enrichment_max must be >= --corner_enrichment_min "
+            "(or <=0 to disable)"
+        )
 
 
     if args.corner_diag_bg_min < 0:
@@ -1229,6 +1290,139 @@ def absorb_short_blocks(blocks, min_size):
     return merged
 
 
+def _local_with_span(local, start, end):
+    """Rebuild a block list with one target spanning [start, end)."""
+    start=int(start)
+    end=int(end)
+    left=[list(b) for b in local if int(b[1])<=start]
+    right=[]
+    for b in local:
+        b0,b1=int(b[0]),int(b[1])
+        if b0>=end:
+            right.append(list(b))
+        elif b1>end and b0<end:
+            right.append([end, b1, b[2]])
+    if not left and local and start>int(local[0][0]):
+        left=[[int(local[0][0]), start, local[0][2]]]
+    if not right and local and end<int(local[-1][1]):
+        right=[[end, int(local[-1][1]), local[-1][2]]]
+    trial=left+[[start, end, 0]]+right
+    return trial, len(left)
+
+
+def _grow_edge_for_index(trial, idx, edge_oneside):
+    if idx<=0 or idx>=len(trial)-1:
+        return edge_oneside or ("left" if idx==len(trial)-1 else "right")
+    return None
+
+
+def _span_side_score(rec, edge_oneside):
+    """
+    Quality of an INV span for grow selection.
+    Both-flank: weaker |ρ| only when BOTH votes pass (avoid oneside creep).
+    Tip oneside: the available arm's |ρ|.
+    """
+    if not rec or rec.get("INV")!=1:
+        return -1.0
+    L=float(rec["left_rho"])
+    R=float(rec["right_rho"])
+    if edge_oneside=="left":
+        return L
+    if edge_oneside=="right":
+        return -R
+    if int(rec.get("left_vote",0))!=1 or int(rec.get("right_vote",0))!=1:
+        return -1.0
+    return float(min(L, -R))
+
+
+def grow_secondary_inv_rec(
+    hic, local, index, rec, args, edge_oneside=None, sub_hi=None
+):
+    """
+    Extend a secondary INV into the next/prev secondary sub (partial OK).
+
+    Not the farthest INV=1 end (that overshoots into the next TAD via weak
+    oneside). Scan candidates and keep the farthest span whose both-flank
+    weaker |ρ| stays within 70% of the peak (chr1B: ~716.2–716.35, not 716.55).
+    """
+    if not rec or rec.get("INV")!=1:
+        return rec
+    res=int(args.res)
+    start0=int(rec["start"])
+    end0=int(rec["end"])
+    best=dict(rec)
+
+    def _test(start, end):
+        trial,idx=_local_with_span(local, start, end)
+        edge=_grow_edge_for_index(trial, idx, edge_oneside)
+        return detect_block_INV(hic, trial, idx, args, edge_oneside=edge), edge
+
+    # Right grow
+    if index+1<len(local):
+        right_limit=int(local[index+1][1])
+    else:
+        right_limit=end0
+    if sub_hi is not None and index+1<sub_hi:
+        right_limit=max(right_limit, int(local[min(index+1, len(local)-1)][1]))
+    right_limit=min(right_limit, end0+3_000_000)
+    if right_limit>end0+res:
+        scored=[]
+        peak=-1.0
+        for end in range(end0, right_limit+res, res):
+            r,edge=_test(start0, end)
+            s=_span_side_score(r, edge)
+            if s<0:
+                continue
+            scored.append((end, r, s))
+            if s>peak:
+                peak=s
+        if scored and peak>0:
+            thr=0.70*peak
+            # farthest end still near the peak both-flank strength
+            keep=[t for t in scored if t[2]>=thr]
+            if keep:
+                best=dict(max(keep, key=lambda t: t[0])[1])
+
+    # Left grow (same rule)
+    start=int(best["start"])
+    end=int(best["end"])
+    if index>0:
+        left_limit=int(local[index-1][0])
+    else:
+        left_limit=start
+    left_limit=max(left_limit, end-3_000_000)
+    if left_limit<start-res:
+        scored=[]
+        peak=-1.0
+        for st in range(start, left_limit-res, -res):
+            r,edge=_test(st, end)
+            s=_span_side_score(r, edge)
+            if s<0:
+                continue
+            scored.append((st, r, s))
+            if s>peak:
+                peak=s
+        if scored and peak>0:
+            thr=0.70*peak
+            keep=[t for t in scored if t[2]>=thr]
+            if keep:
+                best=dict(min(keep, key=lambda t: t[0])[1])
+    return best
+
+
+def _grow_secondary_inv_selfcheck():
+    # ponytail: partial grow into the next tile must beat whole-next merge.
+    local=[
+        [0, 500_000, 0],
+        [500_000, 1_000_000, 1],
+        [1_000_000, 2_000_000, 2],
+        [2_000_000, 3_000_000, 3],
+    ]
+    trial,idx=_local_with_span(local, 500_000, 1_500_000)
+    assert idx==1 and trial[idx]==[500_000, 1_500_000, 0], trial
+    assert trial[idx+1][0]==1_500_000 and trial[idx+1][1]==2_000_000
+
+
 def secondary_louvain_split(
     hic, start, end, resolution, radius, louvain_resolution, min_size,
     direction_lambda=0.5, gap_mask=None, gap_cluster_diag_frac=0.35
@@ -1333,6 +1527,54 @@ def _lift_blocks_selfcheck():
     blocks=[[0, 150_000, 1], [150_000, 400_000, 2], [400_000, 900_000, 3]]
     out=lift_blocks_to_resolution(blocks, 200_000)
     assert out==[[0, 200_000, 1], [200_000, 400_000, 2], [400_000, 1_000_000, 3]], out
+
+
+def _edge_oneside_guard_selfcheck():
+    # ponytail: tip oneside must accept only the true list tip; a synthetic
+    # terminal INV (left-flank orientation only) must pass INV=1.
+    class _A:
+        min_block=1
+        neighbor_scale_fractions=[1.0]
+        neighbor_scale_min_support=1
+        gcor_max_gap_bp=0
+        res=50_000
+        smooth=1
+        rho_cutoff=0.3
+        corner_band_bins=2
+        corner_enrichment_min=0.8
+        corner_enrichment_max=5.0
+        corner_diag_bg_min=0.0
+        lattice_peak_max=0
+        parallel_diag_max=0
+        offdiag_fill_max=0
+        min_s_occupancy=0
+        max_s_gap_frac=-1
+        oneside_min_size=0
+        gap_oneside_min_frac=0
+        gap_mask=None
+    args=_A()
+    blocks=[[0, 500_000, 0], [500_000, 1_000_000, 1], [1_000_000, 1_500_000, 2]]
+    hic=np.eye(30, dtype=float)
+    assert detect_block_INV(hic, blocks, 2, args, edge_oneside="right") is None
+    assert detect_block_INV(hic, blocks, 0, args, edge_oneside="left") is None
+    assert detect_block_INV(hic, blocks, 1, args, edge_oneside="left") is None
+
+    # Two tiles: left flank + chrom-end tip. Paint Left×S so column means
+    # rise along S (INV left-flank sign) and put mass on the scaled diagonal.
+    tip_blocks=[[0, 500_000, 0], [500_000, 1_000_000, 1]]
+    n=20
+    tip_hic=np.zeros((n, n), dtype=float)
+    for i in range(n):
+        tip_hic[i, i]=10.0
+    for r in range(0, 10):
+        for c in range(10, 20):
+            # far end of S contacts left flank → diag band in Left×S
+            tip_hic[r, c]=1.0+0.5*(c-10)+0.05*r
+    rec=detect_block_INV(
+        tip_hic, tip_blocks, 1, args, edge_oneside="left"
+    )
+    assert rec is not None and rec.get("INV")==1, rec
+    assert rec.get("left_vote")==1 and rec.get("detection_side")=="left"
 
 
 ############################################################
@@ -1860,6 +2102,85 @@ def s_matrix_lattice_peak_fraction(mat, near_diag=2, peak_ratio=2.0):
     return float(np.mean(vals > peak_ratio * med))
 
 
+
+def s_matrix_parallel_diag_ratio(mat, near_diag=2, min_band_bins=3):
+    """
+    Strongest off-main-diagonal band mean / main-diagonal mean.
+
+    Tandem repeats / satellite arrays draw a bright stripe parallel to the
+    main diagonal; true INV bowties are corner-local and keep this ratio low.
+    """
+    mat = np.asarray(mat, dtype=float)
+    mat = np.nan_to_num(mat, nan=0.0)
+    n = mat.shape[0]
+    if n < 6 or mat.shape[0] != mat.shape[1]:
+        return float("nan")
+    main = float(np.mean(np.diag(mat, 0)))
+    if main <= 0:
+        return float("nan")
+    best = 0.0
+    min_bins = max(int(min_band_bins), max(3, n // 6))
+    for k in range(int(near_diag) + 1, n - 1):
+        d = np.diag(mat, k)
+        if d.size < min_bins:
+            continue
+        best = max(best, float(np.mean(d)))
+    return float(best / main)
+
+
+def s_matrix_offdiag_fill_ratio(mat, near_lo=1, near_hi=2, far_lo=3):
+    """
+    mean(|i-j| >= far_lo) / mean(near_lo <= |i-j| <= near_hi).
+
+    Blocky/grid repeat clouds keep high contact far from the diagonal;
+    normal Hi-C (and true INV bowties) decay, so this ratio stays low.
+    """
+    mat = np.asarray(mat, dtype=float)
+    mat = np.nan_to_num(mat, nan=0.0)
+    n = mat.shape[0]
+    if n < 6 or mat.shape[0] != mat.shape[1]:
+        return float("nan")
+    i, j = np.indices(mat.shape)
+    d = np.abs(i - j)
+    near = (d >= int(near_lo)) & (d <= int(near_hi))
+    far = d >= int(far_lo)
+    if not near.any() or not far.any():
+        return float("nan")
+    near_mean = float(mat[near].mean())
+    if near_mean <= 0:
+        return float("nan")
+    return float(mat[far].mean() / near_mean)
+
+
+def s_matrix_for_qc(hic, target, args):
+    """
+    S×S used for lattice / parallel-diag / fill QC.
+    Prefer ≤50 kb so coarse detection bins still see repeat stripes.
+    """
+    start = int(target[0])
+    end = int(target[1])
+    res = int(args.res)
+    qc_cap = int(getattr(args, "s_qc_resolution", 50_000))
+    qc_res = min(res, qc_cap) if qc_cap > 0 else res
+    mcool = getattr(args, "mcool_file", None)
+    chrom = getattr(args, "qc_chrom", None)
+    if (
+        mcool
+        and chrom
+        and qc_res < res
+        and (end - start) // qc_res >= 6
+    ):
+        try:
+            clr = cooler.Cooler(f"{mcool}::resolutions/{qc_res}")
+            mat = clr.matrix(
+                balance=bool(getattr(args, "balance", False))
+            ).fetch((chrom, start, end))
+            return np.nan_to_num(np.asarray(mat, dtype=float), nan=0.0)
+        except Exception:
+            pass
+    return get_block_matrix(hic, target, target, res, None)
+
+
 def s_matrix_occupancy(mat):
     """Fraction of nonzero cells in S x S (low = sparse / empty signal)."""
     mat = np.asarray(mat, dtype=float)
@@ -2007,7 +2328,8 @@ def detect_block_INV(
     hic,
     blocks,
     index,
-        args
+        args,
+    edge_oneside=None,
 ):
 
     """
@@ -2016,11 +2338,27 @@ def detect_block_INV(
     GCOR pass: both flanks over |ρ| cutoff; or one flank over cutoff with
     size-dependent oneside rules (see gcor_oneside_accept). Gap in S can
     also rescue the failing flank after masking GAP bins.
+
+    edge_oneside:
+        None — need both neighbors (default)
+        "left" — target is list end; left flank only (chrom 3' / terminal)
+        "right" — target is list start; right flank only (chrom 5')
     """
 
 
-    if index<=0 or index>=len(blocks)-1:
+    n_blocks=len(blocks)
+    if edge_oneside=="left":
+        if index!=n_blocks-1 or index<1:
+            return None
+    elif edge_oneside=="right":
+        if index!=0 or n_blocks<2:
+            return None
+    elif index<=0 or index>=n_blocks-1:
         return None
+
+
+    need_left=edge_oneside!="right"
+    need_right=edge_oneside!="left"
 
 
     target=blocks[index]
@@ -2052,15 +2390,17 @@ def detect_block_INV(
 
     for frac in fractions:
         flank_bp=max(1, int(round(target_size*float(frac))))
-        left_blocks=flank_blocks_by_length(
-            blocks, index, "left", flank_bp
+        left_blocks=(
+            flank_blocks_by_length(blocks, index, "left", flank_bp)
+            if need_left else []
         )
-        right_blocks=flank_blocks_by_length(
-            blocks, index, "right", flank_bp
+        right_blocks=(
+            flank_blocks_by_length(blocks, index, "right", flank_bp)
+            if need_right else []
         )
 
 
-        if not left_blocks or not right_blocks:
+        if (need_left and not left_blocks) or (need_right and not right_blocks):
             scale_records.append({
                 "fraction":float(frac),
                 "valid":0,
@@ -2073,14 +2413,16 @@ def detect_block_INV(
         # Neighbors must abut target, or be separated only by a short gap.
         gap_mask=getattr(args,"gap_mask",None)
         max_gap_bp=int(getattr(args,"gcor_max_gap_bp",2_000_000))
-        if not (
-            _blocks_abut_or_gap_only(
+        abut_ok=True
+        if need_left:
+            abut_ok=abut_ok and _blocks_abut_or_gap_only(
                 left_blocks[-1][1],target[0],gap_mask,args.res,max_gap_bp
             )
-            and _blocks_abut_or_gap_only(
+        if need_right:
+            abut_ok=abut_ok and _blocks_abut_or_gap_only(
                 target[1],right_blocks[0][0],gap_mask,args.res,max_gap_bp
             )
-        ):
+        if not abut_ok:
             scale_records.append({
                 "fraction":float(frac),
                 "valid":0,
@@ -2090,13 +2432,20 @@ def detect_block_INV(
             continue
 
 
-        left_span=left_blocks[-1][1]-left_blocks[0][0]
-        right_span=right_blocks[-1][1]-right_blocks[0][0]
+        left_span=(
+            left_blocks[-1][1]-left_blocks[0][0] if need_left else flank_bp
+        )
+        right_span=(
+            right_blocks[-1][1]-right_blocks[0][0] if need_right else flank_bp
+        )
 
 
         # Chromosome ends may not reach the requested flank; treat as invalid
         # so they do not dilute majority voting.
-        if left_span<flank_bp or right_span<flank_bp:
+        if (
+            (need_left and left_span<flank_bp)
+            or (need_right and right_span<flank_bp)
+        ):
             scale_records.append({
                 "fraction":float(frac),
                 "valid":0,
@@ -2108,45 +2457,57 @@ def detect_block_INV(
 
         # Drop GAP bins inside Left×S / S×Right so white bands do not
         # flatten Spearman orientation (same mask as Louvain clustering).
-        left_parts=[
-            get_block_matrix(hic, block, target, args.res, gap_mask)
-            for block in left_blocks
-        ]
-        right_parts=[
-            get_block_matrix(hic, target, block, args.res, gap_mask)
-            for block in right_blocks
-        ]
-        left_parts=[p for p in left_parts if p.size]
-        right_parts=[p for p in right_parts if p.size]
-        if not left_parts or not right_parts:
-            scale_records.append({
-                "fraction":float(frac),
-                "valid":0,
-                "left_vote":0,
-                "right_vote":0,
-            })
-            continue
-        left_matrix=np.vstack(left_parts)
-        right_matrix=np.hstack(right_parts)
+        left_matrix=None
+        right_matrix=None
+        if need_left:
+            left_parts=[
+                get_block_matrix(hic, block, target, args.res, gap_mask)
+                for block in left_blocks
+            ]
+            left_parts=[p for p in left_parts if p.size]
+            if not left_parts:
+                scale_records.append({
+                    "fraction":float(frac),
+                    "valid":0,
+                    "left_vote":0,
+                    "right_vote":0,
+                })
+                continue
+            left_matrix=np.vstack(left_parts)
+        if need_right:
+            right_parts=[
+                get_block_matrix(hic, target, block, args.res, gap_mask)
+                for block in right_blocks
+            ]
+            right_parts=[p for p in right_parts if p.size]
+            if not right_parts:
+                scale_records.append({
+                    "fraction":float(frac),
+                    "valid":0,
+                    "left_vote":0,
+                    "right_vote":0,
+                })
+                continue
+            right_matrix=np.hstack(right_parts)
 
 
-        left_rho,left_p,_=calculate_direction(
-            left_matrix, "column", args.smooth
-        )
-        right_rho,right_p,_=calculate_direction(
-            right_matrix, "row", args.smooth
-        )
-
-
-        left_vote=int(left_rho>args.rho_cutoff)
-        right_vote=int(right_rho< -args.rho_cutoff)
+        if need_left:
+            left_rho,left_p,_=calculate_direction(
+                left_matrix, "column", args.smooth
+            )
+            left_vote=int(left_rho>args.rho_cutoff)
+        else:
+            left_rho,left_p,left_vote=0.0,1.0,0
+        if need_right:
+            right_rho,right_p,_=calculate_direction(
+                right_matrix, "row", args.smooth
+            )
+            right_vote=int(right_rho< -args.rho_cutoff)
+        else:
+            right_rho,right_p,right_vote=0.0,1.0,0
 
         # Same GCOR matrices: per-side diag/anti; either side may pass.
         band=int(args.corner_band_bins)
-        left_diag,left_anti=rectangle_diag_antidiag_means(left_matrix, band)
-        right_diag,right_anti=rectangle_diag_antidiag_means(right_matrix, band)
-        left_bg=rectangle_offband_mean(left_matrix, band)
-        right_bg=rectangle_offband_mean(right_matrix, band)
 
         def _side_enr(diag, anti):
             if np.isfinite(diag) and np.isfinite(anti) and float(anti)>0:
@@ -2166,10 +2527,24 @@ def detect_block_INV(
                 return float("inf")
             return float("nan")
 
-        left_enr=_side_enr(left_diag, left_anti)
-        right_enr=_side_enr(right_diag, right_anti)
-        left_diag_bg=_diag_bg(left_diag, left_bg)
-        right_diag_bg=_diag_bg(right_diag, right_bg)
+        if need_left:
+            left_diag,left_anti=rectangle_diag_antidiag_means(
+                left_matrix, band
+            )
+            left_bg=rectangle_offband_mean(left_matrix, band)
+            left_enr=_side_enr(left_diag, left_anti)
+            left_diag_bg=_diag_bg(left_diag, left_bg)
+        else:
+            left_diag=left_anti=left_enr=left_diag_bg=float("nan")
+        if need_right:
+            right_diag,right_anti=rectangle_diag_antidiag_means(
+                right_matrix, band
+            )
+            right_bg=rectangle_offband_mean(right_matrix, band)
+            right_enr=_side_enr(right_diag, right_anti)
+            right_diag_bg=_diag_bg(right_diag, right_bg)
+        else:
+            right_diag=right_anti=right_enr=right_diag_bg=float("nan")
         side_vals=[
             v for v in (left_enr, right_enr)
             if np.isfinite(v) or v==float("inf")
@@ -2195,25 +2570,27 @@ def detect_block_INV(
             "left_diag_bg":float(left_diag_bg) if np.isfinite(left_diag_bg) or left_diag_bg==float("inf") else None,
             "right_diag_bg":float(right_diag_bg) if np.isfinite(right_diag_bg) or right_diag_bg==float("inf") else None,
             "corner_enrichment":scale_corner,
-            "left_start":left_blocks[0][0],
-            "left_end":left_blocks[-1][1],
-            "right_start":right_blocks[0][0],
-            "right_end":right_blocks[-1][1],
-            "left_blocks":len(left_blocks),
-            "right_blocks":len(right_blocks),
+            "left_start":left_blocks[0][0] if need_left else target[0],
+            "left_end":left_blocks[-1][1] if need_left else target[0],
+            "right_start":right_blocks[0][0] if need_right else target[1],
+            "right_end":right_blocks[-1][1] if need_right else target[1],
+            "left_blocks":len(left_blocks) if need_left else 0,
+            "right_blocks":len(right_blocks) if need_right else 0,
         })
 
 
-        left_rhos.append(float(left_rho))
-        right_rhos.append(float(right_rho))
-        left_ps.append(float(left_p))
-        right_ps.append(float(right_p))
-        left_votes.append(left_vote)
-        right_votes.append(right_vote)
-        left_starts.append(left_blocks[0][0])
-        left_ends.append(left_blocks[-1][1])
-        right_starts.append(right_blocks[0][0])
-        right_ends.append(right_blocks[-1][1])
+        if need_left:
+            left_rhos.append(float(left_rho))
+            left_ps.append(float(left_p))
+            left_votes.append(left_vote)
+            left_starts.append(left_blocks[0][0])
+            left_ends.append(left_blocks[-1][1])
+        if need_right:
+            right_rhos.append(float(right_rho))
+            right_ps.append(float(right_p))
+            right_votes.append(right_vote)
+            right_starts.append(right_blocks[0][0])
+            right_ends.append(right_blocks[-1][1])
 
 
     valid_scales=sum(1 for r in scale_records if r["valid"]==1)
@@ -2253,9 +2630,11 @@ def detect_block_INV(
     right_end=max(right_ends) if right_ends else target[1]
 
 
-    # Aggregate per-side diag/anti; pass if either side meets corner ratio.
+    # Aggregate per-side diag/anti; pass if either side meets corner ratio
+    # and stays under the upper cap (hyper-bright X/tick FPs).
     # Optional diag/background (default off) kept as a diagnostic gate.
     thr=float(args.corner_enrichment_min)
+    thr_max=float(getattr(args, "corner_enrichment_max", 5.0))
     bg_thr=float(getattr(args, "corner_diag_bg_min", 0.0))
 
     def _finite_mean(vals):
@@ -2278,6 +2657,8 @@ def detect_block_INV(
     def _side_corner_ok(corner, diag_bg):
         if not (np.isfinite(corner) and corner>=thr):
             return False
+        if thr_max>0 and corner>thr_max:
+            return False
         if bg_thr>0:
             return np.isfinite(diag_bg) and diag_bg>=bg_thr
         return True
@@ -2290,15 +2671,50 @@ def detect_block_INV(
         v for v in (left_corner, right_corner) if np.isfinite(v)
     ]
     corner_score=float(max(side_scores)) if side_scores else float("nan")
+    # Hyper-bright on either side / any flank fraction → reject.
+    # Mean aggregation can dilute a loud fraction below thr_max; OR-of-min
+    # can also pass via the quieter side alone.
+    peak_corners=[]
+    for r in scale_records:
+        if r.get("valid")!=1:
+            continue
+        for key in ("left_corner","right_corner"):
+            v=r.get(key)
+            if v is None:
+                continue
+            if np.isfinite(v) or v==float("inf"):
+                peak_corners.append(float(v))
+    peak_corner=(
+        float(max(peak_corners)) if peak_corners else float("nan")
+    )
+    if (
+        thr_max>0
+        and np.isfinite(peak_corner)
+        and float(peak_corner)>float(thr_max)
+    ):
+        corner_pass=0
 
     # S-internal filters on raw S (do not drop GAP here).
-    s_mat=get_block_matrix(hic,target,target,args.res,None)
+    # Lattice / parallel / fill use ≤50kb when available (coarse res hides stripes).
+    s_mat=s_matrix_for_qc(hic,target,args)
     s_raw=s_mat
     lattice_max=float(getattr(args, "lattice_peak_max", 0.30))
     lattice_peak=s_matrix_lattice_peak_fraction(s_mat)
     lattice_pass=1
     if lattice_max>0 and np.isfinite(lattice_peak):
         lattice_pass=int(lattice_peak<=lattice_max)
+
+    parallel_max=float(getattr(args, "parallel_diag_max", 0.30))
+    parallel_diag=s_matrix_parallel_diag_ratio(s_mat)
+    parallel_pass=1
+    if parallel_max>0 and np.isfinite(parallel_diag):
+        parallel_pass=int(parallel_diag<=parallel_max)
+
+    fill_max=float(getattr(args, "offdiag_fill_max", 0.25))
+    offdiag_fill=s_matrix_offdiag_fill_ratio(s_mat)
+    fill_pass=1
+    if fill_max>0 and np.isfinite(offdiag_fill):
+        fill_pass=int(offdiag_fill<=fill_max)
 
     occ_min=float(getattr(args, "min_s_occupancy", 0.60))
     gap_max=float(getattr(args, "max_s_gap_frac", 0.25))
@@ -2321,6 +2737,7 @@ def detect_block_INV(
 
     # Gap rescue (not oneside INV): one flank ok + GAP in S → mask GAP,
     # re-test only the failing flank; accept iff that flank then passes too.
+    # Skip on chrom-end oneside: the missing flank cannot be rescued.
     gap_min=float(getattr(args, "gap_oneside_min_frac", 0.10))
     gap_score=s_gap_frac if np.isfinite(s_gap_frac) else float("nan")
     if np.isfinite(s_gap_bin_frac):
@@ -2331,7 +2748,8 @@ def detect_block_INV(
     gap_rescue=0
     gap_oneside=0  # legacy column; stays 0 (no oneside pass-through)
     if (
-        both_gcor==0
+        edge_oneside is None
+        and both_gcor==0
         and oneside_gcor==1
         and gap_min>0
         and np.isfinite(gap_score)
@@ -2406,19 +2824,30 @@ def detect_block_INV(
 
     # Both flanks always OK. Oneside: long = pure oneside; short = oneside
     # only if the weak flank still has the INV-correct sign.
+    # Chrom-end edge_oneside: no opposite flank → pure oneside on the arm.
     oneside_min_size=int(getattr(args,"oneside_min_size",8_000_000))
-    oneside_ok=gcor_oneside_accept(
-        oneside_gcor=oneside_gcor,
-        left_vote=left_vote_final,
-        right_vote=right_vote_final,
-        mean_left=mean_left,
-        mean_right=mean_right,
-        target_size=target_size,
-        oneside_min_size=oneside_min_size,
-    )
-    gcor_inv=int(both_gcor==1 or oneside_ok==1)
+    if edge_oneside=="left":
+        oneside_ok=int(left_vote_final==1)
+        gcor_inv=oneside_ok
+        detection_side="left" if oneside_ok else "none"
+    elif edge_oneside=="right":
+        oneside_ok=int(right_vote_final==1)
+        gcor_inv=oneside_ok
+        detection_side="right" if oneside_ok else "none"
+    else:
+        oneside_ok=gcor_oneside_accept(
+            oneside_gcor=oneside_gcor,
+            left_vote=left_vote_final,
+            right_vote=right_vote_final,
+            mean_left=mean_left,
+            mean_right=mean_right,
+            target_size=target_size,
+            oneside_min_size=oneside_min_size,
+        )
+        gcor_inv=int(both_gcor==1 or oneside_ok==1)
     inv=int(
-        gcor_inv==1 and corner_pass==1 and lattice_pass==1 and signal_pass==1
+        gcor_inv==1 and corner_pass==1 and lattice_pass==1
+        and parallel_pass==1 and fill_pass==1 and signal_pass==1
     )
 
     def _avg_field(name):
@@ -2453,6 +2882,10 @@ def detect_block_INV(
         "corner_pass":corner_pass,
         "lattice_peak":lattice_peak if np.isfinite(lattice_peak) else "NA",
         "lattice_pass":lattice_pass,
+        "parallel_diag":parallel_diag if np.isfinite(parallel_diag) else "NA",
+        "parallel_pass":parallel_pass,
+        "offdiag_fill":offdiag_fill if np.isfinite(offdiag_fill) else "NA",
+        "fill_pass":fill_pass,
         "s_occupancy":s_occupancy if np.isfinite(s_occupancy) else "NA",
         "s_gap_frac":s_gap_frac if np.isfinite(s_gap_frac) else "NA",
         "s_gap_bin_frac":s_gap_bin_frac if np.isfinite(s_gap_bin_frac) else "NA",
@@ -2512,6 +2945,7 @@ def process_one_chrom(
         "[INFO]",
         chrom
     )
+    args.qc_chrom=chrom
 
 
 
@@ -2655,6 +3089,86 @@ def process_one_chrom(
         results.append(rec)
 
 
+    def _secondary_split_and_test(parent_index, edge_oneside=None):
+        """
+        Re-Louvain a parent tile and keep sub-INVs.
+
+        edge_oneside is set for chrom first/last parents that the main loop
+        never targets: internal subs use both flanks; the sub that remains
+        on the chrom end uses pure oneside on the available arm.
+        """
+        if (
+            split_min<=0
+            or sec_lr<=0
+            or parent_index<0
+            or parent_index>=len(blocks)
+        ):
+            return
+        parent=blocks[parent_index]
+        if parent[1]-parent[0]<split_min:
+            # Below split size: still oneside-test an edge parent itself.
+            if edge_oneside and parent[1]-parent[0]>=args.min_block:
+                _append_inv(
+                    detect_block_INV(
+                        hic, blocks, parent_index, args,
+                        edge_oneside=edge_oneside,
+                    ),
+                    secondary=0,
+                    gap_bridge=0,
+                )
+            return
+        subs=secondary_louvain_split(
+            hic,
+            parent[0],
+            parent[1],
+            args.res,
+            args.radius,
+            sec_lr,
+            args.min_block,
+            direction_lambda=args.direction_lambda,
+            gap_mask=gap_mask,
+            gap_cluster_diag_frac=gap_frac,
+        )
+        if len(subs)<=1:
+            if edge_oneside:
+                _append_inv(
+                    detect_block_INV(
+                        hic, blocks, parent_index, args,
+                        edge_oneside=edge_oneside,
+                    ),
+                    secondary=0,
+                    gap_bridge=0,
+                )
+            return
+        local=blocks[:parent_index]+subs+blocks[parent_index+1:]
+        sub_hi=parent_index+len(subs)
+
+        def _append_grown(j, edge):
+            r0=detect_block_INV(
+                hic, local, j, args, edge_oneside=edge
+            )
+            if not r0 or r0.get("INV")!=1:
+                return
+            r1=grow_secondary_inv_rec(
+                hic, local, j, r0, args,
+                edge_oneside=edge, sub_hi=sub_hi,
+            )
+            _append_inv(r1, secondary=1, gap_bridge=0)
+
+        for j in range(parent_index, sub_hi):
+            if j<=0:
+                # First sub of chrom-start parent: right-flank oneside.
+                if edge_oneside=="right":
+                    _append_grown(j, "right")
+                continue
+            if j>=len(local)-1:
+                # Last sub of chrom-end parent: left-flank oneside.
+                if edge_oneside=="left":
+                    _append_grown(j, "left")
+                continue
+            _append_grown(j, None)
+
+
     for i in range(
         1,
         len(blocks)-1
@@ -2682,30 +3196,9 @@ def process_one_chrom(
         # Large failed parent: re-Louvain inside and keep sub-INVs.
         if (
             r.get("INV")==0
-            and split_min>0
-            and sec_lr>0
             and (blocks[i][1]-blocks[i][0])>=split_min
         ):
-            subs=secondary_louvain_split(
-                hic,
-                blocks[i][0],
-                blocks[i][1],
-                args.res,
-                args.radius,
-                sec_lr,
-                args.min_block,
-                direction_lambda=args.direction_lambda,
-                gap_mask=gap_mask,
-                gap_cluster_diag_frac=gap_frac,
-            )
-            if len(subs)<=1:
-                continue
-            local=blocks[:i]+subs+blocks[i+1:]
-            for j in range(i, i+len(subs)):
-                if j==0 or j==len(local)-1:
-                    continue
-                r2=detect_block_INV(hic, local, j, args)
-                _append_inv(r2, secondary=1, gap_bridge=0)
+            _secondary_split_and_test(i, edge_oneside=None)
 
         # Failed tile: also try same-S with the next tile if only GAP between.
         if (
@@ -2724,6 +3217,13 @@ def process_one_chrom(
             local=blocks[:i]+[bridged]+blocks[i+2:]
             r3=detect_block_INV(hic, local, i, args)
             _append_inv(r3, secondary=0, gap_bridge=1)
+
+
+    # Chrom ends are skipped by the main loop (no opposite flank). Still
+    # secondary-split large tip communities and oneside-test tip subs.
+    if len(blocks)>=2:
+        _secondary_split_and_test(0, edge_oneside="right")
+        _secondary_split_and_test(len(blocks)-1, edge_oneside="left")
 
 
 
@@ -4297,8 +4797,12 @@ def original_detection_command(
         "--outdir",str(scale_dir),
         "--nprocess",str(workers),
         "--corner_enrichment_min","0.8",
+        "--corner_enrichment_max","5.0",
         "--corner_diag_bg_min","0",
         "--lattice_peak_max","0.30",
+        "--parallel_diag_max","0.30",
+        "--offdiag_fill_max","0.25",
+        "--s_qc_resolution","50000",
         "--min_s_occupancy","0.60",
         "--max_s_gap_frac","0.25",
         "--gap_oneside_min_frac","0.10",
@@ -5070,6 +5574,8 @@ def workflow_main():
         # Louvain once at the finest resolution; coarser scales only
         # re-evaluate GCOR on projected communities.
         _lift_blocks_selfcheck()
+        _edge_oneside_guard_selfcheck()
+        _grow_secondary_inv_selfcheck()
         fine_res=resolutions[0]
         fine_dir=scale_dirs[0]
         print(
