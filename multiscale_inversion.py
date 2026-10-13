@@ -4758,20 +4758,32 @@ def parse_workflow_args():
     )
     parser.add_argument("--jobs",type=int,default=min(4,os.cpu_count() or 1))
     parser.add_argument("--outdir",default="INV_results")
+    parser.add_argument(
+        "--plot-only",
+        default=None,
+        metavar="TSV",
+        help=(
+            "skip detection; replot Hi-C figures from an existing "
+            "ALL_INV_multiscale.tsv (or compatible table)"
+        )
+    )
     args=parser.parse_args()
 
-    if not 1<=args.min_support<=N_SCALES:
-        parser.error("--min-support must be between 1 and 4")
-    if args.min_community_size<=0:
-        parser.error("--min-community-size must be > 0")
-    if args.max_merge_gap<0:
-        parser.error("--max-merge-gap must be >= 0")
-    if args.max_inversion_size<=0:
-        parser.error("--max-inversion-size must be > 0")
-    if not 0<args.merge_overlap<=1:
-        parser.error("--merge-overlap must be in (0, 1]")
+    if args.plot_only is None:
+        if not 1<=args.min_support<=N_SCALES:
+            parser.error("--min-support must be between 1 and 4")
+        if args.min_community_size<=0:
+            parser.error("--min-community-size must be > 0")
+        if args.max_merge_gap<0:
+            parser.error("--max-merge-gap must be >= 0")
+        if args.max_inversion_size<=0:
+            parser.error("--max-inversion-size must be > 0")
+        if not 0<args.merge_overlap<=1:
+            parser.error("--merge-overlap must be in (0, 1]")
     if args.jobs<1:
         parser.error("--jobs must be >= 1")
+    if args.plot_only and not Path(args.plot_only).expanduser().is_file():
+        parser.error("file does not exist: "+args.plot_only)
     for name in ("hic_alignments","fasta"):
         value=getattr(args,name)
         if value and not Path(value).expanduser().is_file():
@@ -5357,15 +5369,20 @@ def choose_plot_resolution(resolutions,region_size,max_bins=1_500):
     return resolutions[-1]
 
 
-def choose_local_plot_resolution(resolutions,region_size,target_bins=220):
-    """Pick a scale near Juicebox density (~200 bins), prefer finer when close."""
+def choose_local_plot_resolutions(
+    resolutions,region_size,min_bins=8,max_bins=1_200
+):
+    """Keep every scale that yields a readable square map for this window."""
     resolutions=sorted(int(value) for value in resolutions)
     if not resolutions:
         raise ValueError("no plot resolutions")
-    def score(resolution):
-        bins=max(1,int(np.ceil(region_size/resolution)))
-        return (abs(bins-target_bins),resolution)
-    return min(resolutions,key=score)
+    kept=[
+        resolution for resolution in resolutions
+        if min_bins<=int(np.ceil(region_size/resolution))<=max_bins
+    ]
+    return kept or [resolutions[int(np.argmin([
+        abs(int(np.ceil(region_size/r))-220) for r in resolutions
+    ]))]]
 
 
 def fetch_plot_matrix(clr,region,balance=False):
@@ -5393,31 +5410,72 @@ def heatmap_limits(matrix,upper_percentile=98.0,ignore_diag_bins=0):
     return 0.0,upper if upper>0 else 1.0
 
 
-def draw_hic(ax,matrix,local=False):
+def local_heatmap_norm(matrix):
+    """Same Juicebox-like stretch for every local panel (per-matrix vmax)."""
+    n=int(min(matrix.shape[:2]))
+    band=max(3,n//12)
+    vmin,vmax=heatmap_limits(matrix,99.5,ignore_diag_bins=band)
+    vmax=max(vmax*1.5,1e-6)
+    return PowerNorm(gamma=1.6,vmin=vmin,vmax=vmax,clip=True)
+
+
+def draw_hic(ax,matrix,local=False,norm=None):
     # Juicebox-like Observed (raw). gamma>1 keeps mid contacts pale so domains stay visible.
     if local:
-        n=int(min(matrix.shape[:2]))
-        band=max(3,n//12)
-        vmin,vmax=heatmap_limits(matrix,99.5,ignore_diag_bins=band)
-        vmax=max(vmax*1.5,1e-6)
-        gamma=1.6
+        if norm is None:
+            norm=local_heatmap_norm(matrix)
         interpolation="bilinear"
     else:
         vmin,vmax=heatmap_limits(matrix,98.0)
-        gamma=0.55
+        norm=PowerNorm(gamma=0.55,vmin=vmin,vmax=vmax,clip=True)
         interpolation="nearest"
     return ax.imshow(
-        matrix,cmap="Reds",origin="upper",
-        norm=PowerNorm(gamma=gamma,vmin=vmin,vmax=vmax,clip=True),
+        matrix,cmap="Reds",origin="upper",norm=norm,
         interpolation=interpolation
     )
 
 
-def mark_inversion(ax,start_bin,end_bin,label=None):
+def format_mb(origin_bp,resolution):
+    """Axis ticks as Mb; shared style across all local / overview panels."""
+    def _fmt(value,_):
+        bp=origin_bp+value*resolution
+        mb=bp/1e6
+        if abs(mb)>=100:
+            return f"{mb:.0f}"
+        if abs(mb)>=10:
+            return f"{mb:.1f}"
+        return f"{mb:.2f}"
+    return FuncFormatter(_fmt)
+
+
+def local_plot_window(start,end,chrom_size,flank_factor=1.5):
+    """Symmetric flank when possible; shrink both sides near chrom ends."""
+    event=max(1,int(end)-int(start))
+    want=int(round(flank_factor*event))
+    left_room=int(start)
+    right_room=max(0,int(chrom_size)-int(end))
+    flank=min(want,left_room,right_room)
+    if flank<want:
+        # one side clipped (telomere): use remaining room on the open side
+        # so the cyan box is not crushed into a corner
+        extra=want-flank
+        window_start=max(0,int(start)-flank-min(extra,left_room-flank))
+        window_end=min(
+            int(chrom_size),int(end)+flank+min(extra,right_room-flank)
+        )
+    else:
+        window_start=int(start)-flank
+        window_end=int(end)+flank
+    if window_end<=window_start:
+        window_end=min(int(chrom_size),window_start+max(event,1))
+    return window_start,window_end
+
+
+def mark_inversion(ax,start_bin,end_bin,label=None,linewidth=1.2):
     width=max(1.0,end_bin-start_bin)
     ax.add_patch(Rectangle(
         (start_bin,start_bin),width,width,fill=False,
-        edgecolor="#00e5ff",linewidth=1.0
+        edgecolor="#00e5ff",linewidth=linewidth
     ))
     if label:
         ax.text(
@@ -5431,6 +5489,22 @@ def mark_inversion(ax,start_bin,end_bin,label=None):
                 "alpha":0.75
             }
         )
+
+
+def _style_hic_axes(ax,origin_bp,resolution,ylabel=True):
+    ax.set_aspect("equal",adjustable="box")
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=4))
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=4))
+    tick=format_mb(origin_bp,resolution)
+    ax.xaxis.set_major_formatter(tick)
+    ax.yaxis.set_major_formatter(tick)
+    ax.set_xlabel("Mb",fontsize=10)
+    if ylabel:
+        ax.set_ylabel("Mb",fontsize=10)
+    else:
+        ax.set_ylabel("")
+    ax.tick_params(axis="x",labelsize=8,labelrotation=0)
+    ax.tick_params(axis="y",labelsize=8)
 
 
 def plot_overview(mcool_file,calls,resolution,image_dir,balance=False):
@@ -5452,20 +5526,10 @@ def plot_overview(mcool_file,calls,resolution,image_dir,balance=False):
             mark_inversion(
                 ax,int(call.start)/resolution,int(call.end)/resolution,
                 f"INV{int(call.cluster_id)}\n"
-                f"{chrom}:{int(call.start):,}-{int(call.end):,}"
+                f"{int(call.start)/1e6:.1f}-{int(call.end)/1e6:.1f} Mb"
             )
-        ax.set_title(f"{chrom} | {resolution:,} bp")
-        coordinate=FuncFormatter(
-            lambda value,_:f"{int(value*resolution):,}"
-        )
-        ax.xaxis.set_major_locator(MaxNLocator(nbins=5))
-        ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
-        ax.xaxis.set_major_formatter(coordinate)
-        ax.yaxis.set_major_formatter(coordinate)
-        ax.set_xlabel("Genomic coordinate (bp)")
-        ax.set_ylabel("Genomic coordinate (bp)")
-        ax.tick_params(axis="x",labelsize=8,labelrotation=30)
-        ax.tick_params(axis="y",labelsize=8)
+        ax.set_title(f"{chrom} | {resolution/1e3:.0f} kb",fontsize=11)
+        _style_hic_axes(ax,0,resolution,ylabel=True)
     for ax in axes.flat[len(chromosomes):]:
         ax.axis("off")
     figure.suptitle(
@@ -5476,74 +5540,147 @@ def plot_overview(mcool_file,calls,resolution,image_dir,balance=False):
     plt.close(figure)
 
 
+def _local_plot_selfcheck():
+    # ponytail: window symmetry + multi-res selection must stay readable
+    ws,we=local_plot_window(100,200,1000,flank_factor=1.5)
+    assert (ws,we)==(0,350),(ws,we)
+    ws,we=local_plot_window(500,600,1000,flank_factor=1.5)
+    # event=100, flank=150 each side → window 400 bp
+    assert we-ws==400 and ws==350 and we==750,(ws,we)
+    ws,we=local_plot_window(0,100,1000,flank_factor=1.5)
+    assert ws==0 and we==250,(ws,we)
+    # 20 Mb window → 50–500 kb all stay within [8, 1200] bins
+    kept=choose_local_plot_resolutions(
+        [50_000,100_000,200_000,500_000],20_000_000
+    )
+    assert kept==[50_000,100_000,200_000,500_000],kept
+
+
 def plot_local_inversions(mcool_file,calls,resolutions,image_dir,balance=False):
+    """One multi-panel figure per INV: same window at every detection scale."""
     del balance  # local Hi-C figures are always raw (no ICE/KR)
+    _local_plot_selfcheck()
     local_dir=image_dir/"local"
     local_dir.mkdir(parents=True,exist_ok=True)
     plot_mcool=resolve_plot_mcool(mcool_file)
-    plot_resolutions=available_resolutions(plot_mcool) or list(resolutions)
+    available=available_resolutions(plot_mcool) or list(resolutions)
+    # prefer the workflow scales; fall back to whatever the mcool has
+    want=sorted(int(r) for r in resolutions if int(r) in set(available))
+    if not want:
+        want=list(available)
     if plot_mcool!=str(Path(mcool_file).resolve()):
         print(f"[INFO] local plots from {plot_mcool} (raw)",flush=True)
-    coolers={}
+    coolers={
+        resolution:cooler.Cooler(f"{plot_mcool}::resolutions/{resolution}")
+        for resolution in want
+    }
+    base_clr=coolers[want[0]]
     for _,call in calls.iterrows():
         chrom=str(call.chrom)
         start,end=int(call.start),int(call.end)
-        event_size=max(1,end-start)
-        base_clr=coolers.setdefault(
-            plot_resolutions[0],
-            cooler.Cooler(f"{plot_mcool}::resolutions/{plot_resolutions[0]}")
-        )
         chrom_size=int(base_clr.chromsizes[chrom])
-        # flank = 2x event (was 1x); Juicebox-style context around the call
-        flank=2*event_size
-        window_start=max(0,start-flank)
-        window_end=min(chrom_size,end+flank)
-        resolution=choose_local_plot_resolution(
-            plot_resolutions,window_end-window_start
+        window_start,window_end=local_plot_window(start,end,chrom_size)
+        panel_resolutions=choose_local_plot_resolutions(
+            want,window_end-window_start
         )
-        clr=coolers.setdefault(
-            resolution,
-            cooler.Cooler(f"{plot_mcool}::resolutions/{resolution}")
+        matrices=[
+            fetch_plot_matrix(
+                coolers[resolution],
+                (chrom,window_start,window_end),
+                balance=False
+            )
+            for resolution in panel_resolutions
+        ]
+        n=len(panel_resolutions)
+        figure,axes=plt.subplots(
+            1,n,figsize=(3.8*n,4.4),squeeze=False
         )
-        matrix=fetch_plot_matrix(
-            clr,(chrom,window_start,window_end),balance=False
-        )
-        figure,ax=plt.subplots(figsize=(9.2,7.6),constrained_layout=True)
-        image=draw_hic(ax,matrix,local=True)
-        mark_inversion(
-            ax,(start-window_start)/resolution,(end-window_start)/resolution
-        )
+        for col,(resolution,matrix) in enumerate(
+            zip(panel_resolutions,matrices)
+        ):
+            ax=axes[0,col]
+            draw_hic(ax,matrix,local=True)
+            mark_inversion(
+                ax,
+                (start-window_start)/resolution,
+                (end-window_start)/resolution,
+                linewidth=1.4
+            )
+            ax.set_title(
+                f"{resolution/1e3:.0f} kb",fontsize=12,pad=4,weight="bold"
+            )
+            _style_hic_axes(ax,window_start,resolution,ylabel=(col==0))
+            if col>0:
+                ax.tick_params(axis="y",labelleft=False)
         scale_text=", ".join(
-            f"{int(value):,}" for value in str(call.resolutions).split(",")
+            f"{int(float(value))/1e3:.0f}kb"
+            for value in str(call.resolutions).split(",")
+            if str(value).strip() and str(value).strip().lower()!="nan"
         )
-        ax.set_title(
-            f"INV{int(call.cluster_id)} | {chrom}\n"
-            f"{start:,}–{end:,} bp\n"
-            f"support: {int(call.scale_support)} scales ({scale_text}) | "
-            f"plot: {resolution:,} bp raw (Juicebox-style)",
-            fontsize=12,linespacing=1.25,pad=12
+        figure.suptitle(
+            f"INV{int(call.cluster_id)} | {chrom}  "
+            f"{start/1e6:.2f}–{end/1e6:.2f} Mb\n"
+            f"support: {int(call.scale_support)} scales"
+            f"{f' ({scale_text})' if scale_text else ''}",
+            fontsize=12,linespacing=1.2,y=0.98
         )
-        coordinate=FuncFormatter(
-            lambda value,_:f"{int(window_start+value*resolution):,}"
-        )
-        ax.xaxis.set_major_locator(MaxNLocator(nbins=5))
-        ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
-        ax.xaxis.set_major_formatter(coordinate)
-        ax.yaxis.set_major_formatter(coordinate)
-        ax.set_xlabel("Genomic coordinate (bp)",fontsize=11)
-        ax.set_ylabel("Genomic coordinate (bp)",fontsize=11)
-        ax.tick_params(axis="x",labelsize=8,labelrotation=30)
-        ax.tick_params(axis="y",labelsize=8)
-        colorbar=figure.colorbar(image,ax=ax,shrink=0.78,pad=0.035)
-        colorbar.set_ticks(np.linspace(0,image.norm.vmax,6))
-        colorbar.ax.yaxis.set_major_formatter(
-            FuncFormatter(lambda value,_:f"{value:.3f}")
-        )
-        colorbar.set_label("log1p raw contact",fontsize=10,labelpad=8)
-        colorbar.ax.tick_params(labelsize=9)
+        figure.tight_layout(rect=[0.02,0.02,0.98,0.93])
+        figure.subplots_adjust(wspace=0.22,top=0.90)
         filename=f"INV{int(call.cluster_id):04d}_{chrom}_{start}_{end}.png"
-        figure.savefig(local_dir/filename,dpi=200,bbox_inches="tight")
+        figure.savefig(local_dir/filename,dpi=180,bbox_inches="tight")
         plt.close(figure)
+    collage_local_inversions(local_dir,image_dir/"ALL_INV_local.png")
+
+
+def collage_local_inversions(local_dir,out_path,columns=3,pad=12,bg=255):
+    """Stitch INV*.png panels into one grid overview."""
+    from PIL import Image
+    paths=sorted(Path(local_dir).glob("INV*.png"))
+    if not paths:
+        return None
+    images=[Image.open(path).convert("RGB") for path in paths]
+    n=len(images)
+    columns=max(1,min(int(columns),n))
+    rows=int(np.ceil(n/columns))
+    cell_w=max(im.width for im in images)
+    cell_h=max(im.height for im in images)
+    canvas=Image.new(
+        "RGB",
+        (columns*cell_w+pad*(columns+1),rows*cell_h+pad*(rows+1)),
+        color=(bg,bg,bg)
+    )
+    for i,im in enumerate(images):
+        r,c=divmod(i,columns)
+        x=pad+c*(cell_w+pad)+(cell_w-im.width)//2
+        y=pad+r*(cell_h+pad)+(cell_h-im.height)//2
+        canvas.paste(im, (x,y))
+        im.close()
+    out_path=Path(out_path)
+    out_path.parent.mkdir(parents=True,exist_ok=True)
+    canvas.save(out_path,dpi=(150,150))
+    print(f"[INFO] local collage -> {out_path}",flush=True)
+    return out_path
+
+
+def render_hic_images(mcool_file,result,resolutions,outdir,balance=False):
+    image_dir=Path(outdir)/"HiC_images"
+    image_dir.mkdir(parents=True,exist_ok=True)
+    available=available_resolutions(mcool_file)
+    reference=cooler.Cooler(
+        f"{mcool_file}::resolutions/{resolutions[-1]}"
+    )
+    largest=max(
+        int(reference.chromsizes[str(chrom)])
+        for chrom in result.chrom.astype(str).unique()
+    )
+    overview_resolution=choose_plot_resolution(available,largest)
+    plot_overview(
+        mcool_file,result,overview_resolution,image_dir,balance=balance
+    )
+    plot_local_inversions(
+        mcool_file,result,resolutions,image_dir,balance=balance
+    )
+    return image_dir
 
 
 def workflow_main():
@@ -5565,6 +5702,26 @@ def workflow_main():
     )
     outdir=Path(args.outdir).expanduser().resolve()
     outdir.mkdir(parents=True,exist_ok=True)
+
+    if args.plot_only:
+        tsv=Path(args.plot_only).expanduser().resolve()
+        result=pd.read_csv(tsv,sep="\t")
+        if result.empty:
+            raise SystemExit(f"no calls in {tsv}")
+        need={"cluster_id","chrom","start","end","scale_support","resolutions"}
+        missing=need-set(result.columns)
+        if missing:
+            raise SystemExit(
+                f"{tsv} missing columns: "+", ".join(sorted(missing))
+            )
+        print(f"[INFO] plot-only from {tsv} ({len(result)} calls)",flush=True)
+        image_dir=render_hic_images(
+            args.mcool_file,result,resolutions,outdir,
+            balance=bool(args.balance)
+        )
+        print(f"[DONE] Hi-C figures -> {image_dir}",flush=True)
+        return
+
     script=Path(__file__).resolve()
 
     with tempfile.TemporaryDirectory(prefix="original_inv_") as temporary:
@@ -5687,22 +5844,8 @@ def workflow_main():
         result.to_csv(result_path,sep="\t",index=False)
 
     if not result.empty:
-        image_dir=outdir/"HiC_images"
-        image_dir.mkdir(parents=True,exist_ok=True)
-        reference=cooler.Cooler(
-            f"{args.mcool_file}::resolutions/{resolutions[-1]}"
-        )
-        largest=max(
-            int(reference.chromsizes[str(chrom)])
-            for chrom in result.chrom.astype(str).unique()
-        )
-        overview_resolution=choose_plot_resolution(available,largest)
-        plot_overview(
-            args.mcool_file,result,overview_resolution,image_dir,
-            balance=bool(args.balance)
-        )
-        plot_local_inversions(
-            args.mcool_file,result,resolutions,image_dir,
+        render_hic_images(
+            args.mcool_file,result,resolutions,outdir,
             balance=bool(args.balance)
         )
     print(
