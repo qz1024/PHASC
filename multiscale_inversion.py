@@ -331,8 +331,10 @@ def parse_args():
         type=float,
         default=0.30,
         help=(
-            "max allowed (best off-diag band mean)/(main-diag) inside S; "
-            "rejects parallel-stripe tandem/satellite (default: 0.30; <=0 disables)"
+            "max paired ±k parallel stripe length span / diag length inside S; "
+            "stripe continuing outside counts as 1.0; flank stripes with "
+            "k>=|S|/2 also drop when their mapped-inbox span >= 0.5 "
+            "(default: 0.30; <=0 disables the length/extends gates only)"
         )
     )
 
@@ -377,6 +379,18 @@ def parse_args():
         help=(
             "max fraction of S x S cells covered by sparse (white-band) rows "
             "or cols; rejects blocky gap lattices (default: 0.25; <0 disables)"
+        )
+    )
+
+
+    parser.add_argument(
+        "--gcor_low_signal_frac",
+        type=float,
+        default=0.3,
+        help=(
+            "before GCOR Spearman, drop flank×S rows/cols whose mean is < "
+            "this × median(positive axis means); kills hole/dead-strip bias "
+            "(default: 0.3; <=0 disables)"
         )
     )
 
@@ -2112,16 +2126,12 @@ def _trimmed_mean_1d(v, trim=0.10):
     return float(np.mean(v[k : n - k]))
 
 
-def _robust_axis_mean(mat, axis, trim=0.10):
+def _robust_axis_mean(mat, axis, trim=0.0):
     """
-    Collapse `mat` along `axis` with a per-slice trimmed mean.
+    Collapse `mat` along `axis` with a per-slice mean.
 
-    For each row (axis=1) or column (axis=0): drop the lowest/highest
-    `trim` fraction of contacts, then average the remainder. Stops hot
-    pixels from owning the GCOR profile.
-
-    Vectorized via nanpercentile fences (keep middle 1-2·trim); same
-    spirit as sort-trim, far cheaper than apply_along_axis.
+    trim=0 (default): plain nanmean. trim>0: drop that fraction at each
+    end of the slice (legacy hot-pixel guard; GCOR no longer uses it).
     """
     mat = np.asarray(mat, dtype=float)
     if mat.ndim != 2 or mat.size == 0:
@@ -2138,17 +2148,59 @@ def _robust_axis_mean(mat, axis, trim=0.10):
     return np.nan_to_num(np.asarray(signal, dtype=float), nan=0.0)
 
 
+def filter_low_signal_axes(mat, mean_frac=0.3, min_keep=3):
+    """
+    Drop rows/cols whose mean is < mean_frac × median(positive axis means).
+
+    Dead / hole strips in flank×S bias Spearman toward false INV votes
+    (INV11: four near-zero S columns near 640 Mb → ρ 0.36→0.19).
+    mean_frac<=0 disables. If too few axes remain, keep the original mat.
+    """
+    mat=np.asarray(mat,dtype=float)
+    if mat.ndim!=2 or mat.size==0 or float(mean_frac)<=0:
+        return mat
+    work=np.nan_to_num(mat,nan=0.0)
+    row_m=work.mean(axis=1)
+    col_m=work.mean(axis=0)
+
+    def _keep(means):
+        pos=means[means>0]
+        if pos.size==0:
+            return np.ones(int(means.size),dtype=bool)
+        thr=float(mean_frac)*float(np.median(pos))
+        keep=means>=thr
+        if int(keep.sum())<int(min_keep):
+            return np.ones(int(means.size),dtype=bool)
+        return keep
+
+    r_keep=_keep(row_m)
+    c_keep=_keep(col_m)
+    if int(r_keep.sum())<int(min_keep) or int(c_keep.sum())<int(min_keep):
+        return work
+    return work[np.ix_(r_keep,c_keep)]
+
+
 def calculate_direction(
     mat,
     axis,
-        smooth=5
+        smooth=5,
+    trim=0.0,
+    low_signal_frac=0.3,
 ):
     """
     Orientation trend of a flank×S (or S×flank) contact rectangle.
 
-    Pipeline: per row/column trimmed mean (drop lowest/highest 10%) →
-    optional box smooth → Spearman(x, signal).
+    Pipeline: drop low-signal rows/cols → per row/column mean (optional trim)
+    → box smooth → Spearman.
+    trim=0 keeps all contacts (default); >0 drops that fraction at each end.
+    low_signal_frac: drop axes below frac×median mean (default 0.3; <=0 off).
     """
+
+    if mat.size==0:
+
+        return 0,1,None
+
+    mat=filter_low_signal_axes(mat, mean_frac=low_signal_frac)
 
     if mat.size==0:
 
@@ -2158,12 +2210,12 @@ def calculate_direction(
 
     if axis=="column":
 
-        signal=_robust_axis_mean(mat, axis=0, trim=0.10)
+        signal=_robust_axis_mean(mat, axis=0, trim=trim)
 
 
     elif axis=="row":
 
-        signal=_robust_axis_mean(mat, axis=1, trim=0.10)
+        signal=_robust_axis_mean(mat, axis=1, trim=trim)
 
 
     else:
@@ -2228,19 +2280,33 @@ def calculate_direction(
 
 
 def _calculate_direction_selfcheck():
-    # Trimmed mean drops the single 1e9 hot pixel (1/12 < 10%? floor(12*0.1)=1).
+    # trim helper still drops ends when asked
     mat=np.tile(np.arange(20, dtype=float), (12, 1))
     mat[0, 10]=1e9
-    # drop 1 low + 1 high from 12 values → eleven 10s lose one → mean 10
     assert abs(_trimmed_mean_1d(mat[:, 10], 0.10) - 10.0) < 1e-6
-    rho,_,_=calculate_direction(mat, "column", smooth=1)
+    # default trim=0: plain mean; gradient still gives strong Spearman
+    rho,_,_=calculate_direction(mat, "column", smooth=1, trim=0.0)
     assert rho>0.8, rho
     mat2=np.tile(np.arange(20, 0, -1, dtype=float), (12, 1))
-    rho2,_,_=calculate_direction(mat2, "column", smooth=1)
+    rho2,_,_=calculate_direction(mat2, "column", smooth=1, trim=0.0)
     assert rho2<-0.8, rho2
     mat3=mat.T
-    rho3,_,_=calculate_direction(mat3, "row", smooth=1)
+    rho3,_,_=calculate_direction(mat3, "row", smooth=1, trim=0.0)
     assert rho3>0.8, rho3
+    # low-signal strip: four dead S columns must not invent a rising vote
+    rng=np.random.default_rng(0)
+    flat=np.full((40, 30), 3.0) + rng.normal(0, 0.2, size=(40, 30))
+    flat=np.clip(flat, 0, None)
+    flat[:, 2:6]=0.2  # abnormal low cols near start of S
+    rho_off,_,_=calculate_direction(
+        flat, "column", smooth=1, trim=0.0, low_signal_frac=0.0
+    )
+    rho_on,_,_=calculate_direction(
+        flat, "column", smooth=1, trim=0.0, low_signal_frac=0.3
+    )
+    assert abs(rho_on)<abs(rho_off) or abs(rho_on)<0.25, (rho_off, rho_on)
+    kept=filter_low_signal_axes(flat, mean_frac=0.3)
+    assert kept.shape[1]<flat.shape[1]
 
 
 
@@ -2324,29 +2390,300 @@ def s_matrix_lattice_peak_fraction(mat, near_diag=2, peak_ratio=2.0):
 
 
 
-def s_matrix_parallel_diag_ratio(mat, near_diag=2, min_band_bins=3):
-    """
-    Strongest off-main-diagonal band mean / main-diagonal mean.
+def _diag_span_frac(diag, thr):
+    """First-to-last on-bin span / diagonal length (0 if none on)."""
+    on = np.asarray(diag, dtype=float) >= float(thr)
+    if not on.any():
+        return 0.0
+    idx = np.flatnonzero(on)
+    return float(idx[-1] - idx[0] + 1) / float(on.size)
 
-    Tandem repeats / satellite arrays draw a bright stripe parallel to the
-    main diagonal; true INV bowties are corner-local and keep this ratio low.
+
+def s_matrix_parallel_length_frac(mat, near_diag=2, thr_frac=0.15):
+    """
+    Paired ±k parallel-stripe *length* through the matrix.
+
+    For each offset k>near_diag: mark bins >= thr_frac * mean(main diag),
+    take first→last span / diag length on +k and on -k, keep min(±k).
+    Score = max over k. Intensity is only a binary on/off; the gate is length.
     """
     mat = np.asarray(mat, dtype=float)
     mat = np.nan_to_num(mat, nan=0.0)
     n = mat.shape[0]
     if n < 6 or mat.shape[0] != mat.shape[1]:
-        return float("nan")
+        return float("nan"), None
     main = float(np.mean(np.diag(mat, 0)))
     if main <= 0:
-        return float("nan")
+        return float("nan"), None
+    thr = float(thr_frac) * main
     best = 0.0
-    min_bins = max(int(min_band_bins), max(3, n // 6))
+    best_k = None
     for k in range(int(near_diag) + 1, n - 1):
-        d = np.diag(mat, k)
-        if d.size < min_bins:
+        d_pos = np.asarray(np.diag(mat, k), dtype=float)
+        d_neg = np.asarray(np.diag(mat, -k), dtype=float)
+        if d_pos.size < 3 or d_neg.size < 3:
             continue
-        best = max(best, float(np.mean(d)))
-    return float(best / main)
+        sc = min(_diag_span_frac(d_pos, thr), _diag_span_frac(d_neg, thr))
+        if sc > best:
+            best = sc
+            best_k = k
+    return float(best), best_k
+
+
+def s_matrix_parallel_diag_ratio(mat, near_diag=2, thr_frac=0.15):
+    """Alias: parallel length fraction (legacy name used by per-call QC)."""
+    frac, _ = s_matrix_parallel_length_frac(
+        mat, near_diag=near_diag, thr_frac=thr_frac
+    )
+    return frac
+
+
+def parallel_stripe_extends_outside(
+    W,
+    w0,
+    start,
+    end,
+    res,
+    near_diag=2,
+    thr_frac=0.15,
+    in_min=0.35,
+    out_min=0.08,
+    w_span_min=0.20,
+):
+    """
+    True if a paired ±k stripe in the flanking window crosses the call
+    interval and continues outside it → treat in-box length as 100%.
+    """
+    W = np.asarray(W, dtype=float)
+    W = np.nan_to_num(W, nan=0.0)
+    n = W.shape[0]
+    if n < 6 or W.shape[0] != W.shape[1]:
+        return False, None
+    main = float(np.mean(np.diag(W, 0)))
+    if main <= 0:
+        return False, None
+    thr = float(thr_frac) * main
+    s0 = max(0, min(n, (int(start) - int(w0)) // int(res)))
+    s1 = max(s0, min(n, (int(end) - int(w0) + int(res) - 1) // int(res)))
+    best_k = None
+    best_sc = -1.0
+    for k in range(int(near_diag) + 1, n - 1):
+        d_pos = np.asarray(np.diag(W, k), dtype=float)
+        d_neg = np.asarray(np.diag(W, -k), dtype=float)
+        if d_pos.size < 3:
+            continue
+        mask_in = np.zeros(d_pos.size, dtype=bool)
+        for i in range(d_pos.size):
+            if (s0 <= i < s1) or (s0 <= i + k < s1):
+                mask_in[i] = True
+        if int(mask_in.sum()) < 3 or int((~mask_in).sum()) < 3:
+            continue
+        in_on = min(
+            float((d_pos[mask_in] >= thr).mean()),
+            float((d_neg[mask_in] >= thr).mean()),
+        )
+        out_on = min(
+            float((d_pos[~mask_in] >= thr).mean()),
+            float((d_neg[~mask_in] >= thr).mean()),
+        )
+        w_span = min(
+            _diag_span_frac(d_pos, thr), _diag_span_frac(d_neg, thr)
+        )
+        if (
+            in_on >= float(in_min)
+            and out_on >= float(out_min)
+            and w_span >= float(w_span_min)
+        ):
+            sc = in_on + out_on + w_span
+            if sc > best_sc:
+                best_sc = sc
+                best_k = k
+    return best_k is not None, best_k
+
+
+def parallel_stripe_mapped_inbox_frac(
+    W,
+    w0,
+    start,
+    end,
+    res,
+    near_diag=2,
+    thr_frac=0.15,
+):
+    """
+    Project paired ±k parallel stripes from a flank window onto the call.
+
+    Only offsets k >= |call|/2 are scored — those cannot fit inside S, so
+    S-internal parallel_diag misses them (INV13: k≈1.4 Mb on a 1.2 Mb box).
+
+    For each such k: mark call bins that are an endpoint of an ON cell on
+    +k / -k; mapped length = first→last hit span / |call|. Return
+    max_k min(+k, -k) of that fraction.
+    """
+    W = np.asarray(W, dtype=float)
+    W = np.nan_to_num(W, nan=0.0)
+    n = W.shape[0]
+    if n < 6 or W.shape[0] != W.shape[1]:
+        return 0.0, None
+    main = float(np.mean(np.diag(W, 0)))
+    if main <= 0:
+        return 0.0, None
+    thr = float(thr_frac) * main
+    s0 = max(0, min(n, (int(start) - int(w0)) // int(res)))
+    s1 = max(s0, min(n, (int(end) - int(w0) + int(res) - 1) // int(res)))
+    n_call = int(s1 - s0)
+    if n_call < 3:
+        return 0.0, None
+    # ponytail: skip near-diag k; only stripes too wide for S (ceiling:
+    # misses a short in-box stripe that also leaks outside — s_len covers that)
+    k_lo = max(int(near_diag) + 1, n_call // 2)
+    best = 0.0
+    best_k = None
+    for k in range(k_lo, n - 1):
+        scores = []
+        for sign in (1, -1):
+            d = np.asarray(np.diag(W, sign * k), dtype=float)
+            hit = np.zeros(n_call, dtype=bool)
+            for i, v in enumerate(d):
+                if float(v) < thr:
+                    continue
+                a, b = (i, i + k) if sign > 0 else (i + k, i)
+                for p in (a, b):
+                    if s0 <= p < s1:
+                        hit[p - s0] = True
+            if not hit.any():
+                scores.append(0.0)
+                continue
+            idx = np.flatnonzero(hit)
+            scores.append(float(idx[-1] - idx[0] + 1) / float(n_call))
+        sc = min(scores) if scores else 0.0
+        if sc > best:
+            best = sc
+            best_k = k
+    return float(best), best_k
+
+
+def _parallel_diag_selfcheck():
+    n = 40
+    sat = np.eye(n) * 10.0
+    for i in range(n - 12):
+        sat[i, i + 12] = 8.0
+        sat[i + 12, i] = 8.0
+    frac, k = s_matrix_parallel_length_frac(sat)
+    assert k == 12 and frac >= 0.9, (frac, k)
+    # short dash: first→last span is small vs full diag
+    dash = np.eye(n) * 10.0
+    for i in range(5, 10):
+        dash[i, i + 12] = 9.0
+        dash[i + 12, i] = 9.0
+    dfrac, _ = s_matrix_parallel_length_frac(dash)
+    assert 0.05 <= dfrac <= 0.5, dfrac
+    # INV13-like: call too small for k, stripe hits both arms → mapped≈1
+    W = np.eye(80) * 10.0
+    # call bins [30, 42); stripe k=20 hits left arm + right-outside and
+    # right arm + left-outside so both call ends light up
+    for i in range(28, 38):
+        W[i, i + 20] = 9.0
+        W[i + 20, i] = 9.0
+    mapped, mk = parallel_stripe_mapped_inbox_frac(
+        W, w0=0, start=30, end=42, res=1, thr_frac=0.15
+    )
+    assert mk == 20 and mapped >= 0.5, (mapped, mk)
+
+
+def filter_parallel_stripe_calls(
+    mcool_file,
+    calls,
+    resolution=50_000,
+    parallel_diag_max=0.30,
+    parallel_mass_frac_max=0.0,
+    context_flank_factor=3.0,
+    thr_frac=0.15,
+    mapped_inbox_min=0.5,
+):
+    """
+    Drop calls whose paired ±k parallel stripes *traverse* too much of the
+    matrix (length span / diag length >= parallel_diag_max).
+
+    Outside the box (3× flank window):
+      1) stripe continues through the call → in-box length = 100%
+         (INV10-like nested field);
+      2) else project the stripe onto the call: mapped length / |call|
+         >= mapped_inbox_min (default 0.5) also drops — catches offsets
+         wider than S that S-internal QC cannot see (INV13).
+    parallel_mass_frac_max kept for CLI compat; ignored (<=0).
+    """
+    if calls is None or calls.empty:
+        return calls
+    if float(parallel_diag_max) <= 0 and float(mapped_inbox_min) <= 0:
+        return calls
+    _parallel_diag_selfcheck()
+    plot_mcool = resolve_plot_mcool(mcool_file)
+    res = int(resolution)
+    clr = cooler.Cooler(f"{plot_mcool}::resolutions/{res}")
+    keep = []
+    n_int = 0
+    n_out = 0
+    n_map = 0
+    for _, row in calls.iterrows():
+        chrom = str(row.chrom)
+        start, end = int(row.start), int(row.end)
+        csize = int(clr.chromsizes[chrom])
+        start = max(0, min(start, csize - 1))
+        end = max(start + 1, min(end, csize))
+        size = end - start
+        if size < 6 * res:
+            keep.append(True)
+            continue
+        S = np.nan_to_num(
+            clr.matrix(balance=False).fetch((chrom, start, end)), nan=0.0
+        )
+        s_len, _ = s_matrix_parallel_length_frac(S, thr_frac=thr_frac)
+        flank = int(round(size * float(context_flank_factor)))
+        w0 = max(0, start - flank)
+        w1 = min(csize, end + flank)
+        extends = False
+        mapped = 0.0
+        if w1 - w0 >= 6 * res:
+            W = np.nan_to_num(
+                clr.matrix(balance=False).fetch((chrom, w0, w1)), nan=0.0
+            )
+            extends, _ = parallel_stripe_extends_outside(
+                W, w0, start, end, res, thr_frac=thr_frac
+            )
+            mapped, _ = parallel_stripe_mapped_inbox_frac(
+                W, w0, start, end, res, thr_frac=thr_frac
+            )
+        eff = 1.0 if extends else (
+            float(s_len) if np.isfinite(s_len) else 0.0
+        )
+        drop_len = (
+            float(parallel_diag_max) > 0
+            and eff >= float(parallel_diag_max)
+        )
+        drop_map = (
+            float(mapped_inbox_min) > 0
+            and float(mapped) >= float(mapped_inbox_min)
+        )
+        if drop_len or drop_map:
+            keep.append(False)
+            if drop_map and not drop_len:
+                n_map += 1
+            elif extends:
+                n_out += 1
+            else:
+                n_int += 1
+            continue
+        keep.append(True)
+    out = calls.loc[keep].copy().reset_index(drop=True)
+    if n_int or n_out or n_map:
+        print(
+            f"[INFO] parallel-stripe filter: drop length={n_int} "
+            f"outside-as-100%={n_out} mapped-inbox={n_map} "
+            f"(length>={parallel_diag_max}, mapped>={mapped_inbox_min})",
+            flush=True,
+        )
+    return out
 
 
 def s_matrix_offdiag_fill_ratio(mat, near_lo=1, near_hi=2, far_lo=3):
@@ -2914,16 +3251,25 @@ def detect_block_INV(
             right_matrix=np.hstack(right_parts)
 
 
+        low_frac=float(getattr(args,"gcor_low_signal_frac",0.3))
         if need_left:
+            left_matrix=filter_low_signal_axes(
+                left_matrix, mean_frac=low_frac
+            )
             left_rho,left_p,_=calculate_direction(
-                left_matrix, "column", args.smooth
+                left_matrix, "column", args.smooth,
+                low_signal_frac=0.0,  # already filtered
             )
             left_vote=int(left_rho>rho_cut)
         else:
             left_rho,left_p,left_vote=0.0,1.0,0
         if need_right:
+            right_matrix=filter_low_signal_axes(
+                right_matrix, mean_frac=low_frac
+            )
             right_rho,right_p,_=calculate_direction(
-                right_matrix, "row", args.smooth
+                right_matrix, "row", args.smooth,
+                low_signal_frac=0.0,
             )
             right_vote=int(right_rho< -rho_cut)
         else:
@@ -3249,6 +3595,7 @@ def detect_block_INV(
             right_span=right_blocks[-1][1]-right_blocks[0][0]
             if left_span<flank_bp or right_span<flank_bp:
                 continue
+            low_frac=float(getattr(args,"gcor_low_signal_frac",0.3))
             if fail_left:
                 parts=[
                     get_block_matrix(hic,block,target,args.res,gm)
@@ -3257,8 +3604,10 @@ def detect_block_INV(
                 parts=[p for p in parts if p.size]
                 if not parts:
                     continue
-                mat=np.vstack(parts)
-                rho,p,_=calculate_direction(mat,"column",args.smooth)
+                mat=filter_low_signal_axes(np.vstack(parts), mean_frac=low_frac)
+                rho,p,_=calculate_direction(
+                    mat,"column",args.smooth,low_signal_frac=0.0
+                )
                 rescue_votes.append(int(rho>rho_cut))
             else:
                 parts=[
@@ -3268,8 +3617,10 @@ def detect_block_INV(
                 parts=[p for p in parts if p.size]
                 if not parts:
                     continue
-                mat=np.hstack(parts)
-                rho,p,_=calculate_direction(mat,"row",args.smooth)
+                mat=filter_low_signal_axes(np.hstack(parts), mean_frac=low_frac)
+                rho,p,_=calculate_direction(
+                    mat,"row",args.smooth,low_signal_frac=0.0
+                )
                 rescue_votes.append(int(rho<-rho_cut))
             rescue_rhos.append(float(rho))
             rescue_ps.append(float(p))
@@ -3751,6 +4102,7 @@ def diagnose_region(mcool_file, region, res=50_000, balance=False, outdir="diagn
         max_s_gap_frac=0.25,
         s_anti_diag_min=2.0,
         flip_improve_min=0.2,
+        gcor_low_signal_frac=0.3,
         tip_min_s_occupancy=0.15,
         tip_max_s_gap_frac=0.70,
         tip_allow_nan_corner=True,
@@ -5870,6 +6222,15 @@ def parse_workflow_args():
         help="relaxed |ρ| cutoff for large communities (default: 0.20)"
     )
     parser.add_argument(
+        "--gcor-low-signal-frac",
+        type=float,
+        default=0.3,
+        help=(
+            "drop flank×S rows/cols with mean < frac×median before GCOR "
+            "(default: 0.3; <=0 off)"
+        )
+    )
+    parser.add_argument(
         "--s-anti-diag-min",
         type=float,
         default=2.0,
@@ -5886,6 +6247,24 @@ def parse_workflow_args():
             "< -1e8 disables)"
         )
     )
+    parser.add_argument(
+        "--parallel-diag-max",
+        type=float,
+        default=0.30,
+        help=(
+            "drop if paired ±k parallel stripe length span / diag length "
+            ">= this; stripe continuing outside the box counts as 1.0 "
+            "(default: 0.30; <=0 disables)"
+        )
+    )
+    parser.add_argument(
+        "--parallel-mass-frac-max",
+        type=float,
+        default=0.0,
+        help=(
+            "deprecated (length gate only); kept for CLI compat, ignored"
+        )
+    )
     args=parser.parse_args()
     args.tip_anti_diag_rescue=not args.no_tip_anti_diag_rescue
     args.tip_anti_diag_min=float(args.tip_anti_diag_min)
@@ -5895,8 +6274,11 @@ def parse_workflow_args():
     args.native_coarse_louvain=bool(args.native_coarse_louvain)
     args.large_block_min_size=int(args.large_block_min_size)
     args.large_block_rho_cutoff=float(args.large_block_rho_cutoff)
+    args.gcor_low_signal_frac=float(args.gcor_low_signal_frac)
     args.s_anti_diag_min=float(args.s_anti_diag_min)
     args.flip_improve_min=float(args.flip_improve_min)
+    args.parallel_diag_max=float(args.parallel_diag_max)
+    args.parallel_mass_frac_max=float(args.parallel_mass_frac_max)
     # kebab → snake aliases used by original_detection_command
     args.tip_anti_diag_min_size=3_000_000
     args.tip_anti_diag_max_size=30_000_000
@@ -5978,6 +6360,9 @@ def original_detection_command(
         ),
         "--large_tip_max_s_gap_frac",str(
             getattr(args,"large_tip_max_s_gap_frac",0.85)
+        ),
+        "--gcor_low_signal_frac",str(
+            getattr(args,"gcor_low_signal_frac",0.3)
         ),
         "--s_anti_diag_min",str(getattr(args,"s_anti_diag_min",2.0)),
         "--flip_improve_min",str(getattr(args,"flip_improve_min",0.2)),
@@ -7029,6 +7414,14 @@ def workflow_main():
                 f"[INFO] dedup overlapping INV: {n_before} -> {len(result)}",
                 flush=True
             )
+        result=filter_parallel_stripe_calls(
+            args.mcool_file,
+            result,
+            resolutions[0],
+            parallel_diag_max=float(
+                getattr(args, "parallel_diag_max", 0.30)
+            ),
+        )
 
     if not result.empty and (args.hic_alignments or args.fasta):
         gap_hints={}
