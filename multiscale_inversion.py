@@ -119,7 +119,7 @@ def parse_args():
     parser.add_argument(
         "--direction_lambda",
         type=float,
-        default=0.5
+        default=2.0
     )
 
 
@@ -173,7 +173,7 @@ def parse_args():
     parser.add_argument(
         "--large_block_min_size",
         type=int,
-        default=15_000_000,
+        default=30_000_000,
         help=(
             "communities at least this large use --large_block_rho_cutoff "
             "instead of --rho_cutoff (default: 15000000; <=0 disables)"
@@ -1227,7 +1227,7 @@ def paint_gap_bin_labels(labels, gap_mask):
 
 
 def louvain_labels_gap_compressed(
-    norm, radius, gap_mask, louvain_resolution=1.0, direction_lambda=0.5
+    norm, radius, gap_mask, louvain_resolution=1.0, direction_lambda=2.0
 ):
     """
     Mask GAP by dropping those bins from the graph topology: non-GAP bins on
@@ -1592,7 +1592,7 @@ def _grow_secondary_inv_selfcheck():
 
 def secondary_louvain_split(
     hic, start, end, resolution, radius, louvain_resolution, min_size,
-    direction_lambda=0.5, gap_mask=None, gap_cluster_diag_frac=0.35
+    direction_lambda=2.0, gap_mask=None, gap_cluster_diag_frac=0.35
 ):
     """
     Re-Louvain one genomic interval so nested communities can separate.
@@ -2399,13 +2399,42 @@ def _diag_span_frac(diag, thr):
     return float(idx[-1] - idx[0] + 1) / float(on.size)
 
 
-def s_matrix_parallel_length_frac(mat, near_diag=2, thr_frac=0.15):
+def _diag_occupancy(diag, thr):
+    d = np.asarray(diag, dtype=float)
+    if d.size == 0:
+        return 0.0
+    return float(np.mean(d >= float(thr)))
+
+
+def _parallel_k_bounds(n, near_diag=2, min_k_frac=0.10, max_k_frac=0.45):
+    """
+    Offset range for parallel-stripe tests.
+
+    Skip near-main-diag thickness (false + on large S) and near-anti-diag
+    offsets (true INV bowtie / breakpoint linking).
+    """
+    n = int(n)
+    lo = max(int(near_diag) + 1, int(np.ceil(float(min_k_frac) * n)))
+    hi = max(lo + 1, int(np.floor(float(max_k_frac) * n)))
+    hi = min(hi, max(lo + 1, n - 2))
+    return int(lo), int(hi)
+
+
+def s_matrix_parallel_length_frac(
+    mat,
+    near_diag=2,
+    thr_frac=0.15,
+    min_k_frac=0.10,
+    max_k_frac=0.45,
+    min_occupancy=0.10,
+):
     """
     Paired ±k parallel-stripe *length* through the matrix.
 
-    For each offset k>near_diag: mark bins >= thr_frac * mean(main diag),
-    take first→last span / diag length on +k and on -k, keep min(±k).
-    Score = max over k. Intensity is only a binary on/off; the gate is length.
+    For each offset k in a mid-band (not near main/anti diag): mark bins
+    >= thr_frac * mean(main diag), require both ±k to have occupancy
+    >= min_occupancy (drops sparse tip-to-tip false spans), then take
+    first→last span / diag length; score = max_k min(+k,-k).
     """
     mat = np.asarray(mat, dtype=float)
     mat = np.nan_to_num(mat, nan=0.0)
@@ -2416,12 +2445,18 @@ def s_matrix_parallel_length_frac(mat, near_diag=2, thr_frac=0.15):
     if main <= 0:
         return float("nan"), None
     thr = float(thr_frac) * main
+    k_lo, k_hi = _parallel_k_bounds(
+        n, near_diag=near_diag, min_k_frac=min_k_frac, max_k_frac=max_k_frac
+    )
     best = 0.0
     best_k = None
-    for k in range(int(near_diag) + 1, n - 1):
+    for k in range(k_lo, k_hi):
         d_pos = np.asarray(np.diag(mat, k), dtype=float)
         d_neg = np.asarray(np.diag(mat, -k), dtype=float)
         if d_pos.size < 3 or d_neg.size < 3:
+            continue
+        occ = min(_diag_occupancy(d_pos, thr), _diag_occupancy(d_neg, thr))
+        if occ < float(min_occupancy):
             continue
         sc = min(_diag_span_frac(d_pos, thr), _diag_span_frac(d_neg, thr))
         if sc > best:
@@ -2449,6 +2484,8 @@ def parallel_stripe_extends_outside(
     in_min=0.35,
     out_min=0.08,
     w_span_min=0.20,
+    min_k_frac=0.10,
+    max_k_frac=0.45,
 ):
     """
     True if a paired ±k stripe in the flanking window crosses the call
@@ -2465,9 +2502,12 @@ def parallel_stripe_extends_outside(
     thr = float(thr_frac) * main
     s0 = max(0, min(n, (int(start) - int(w0)) // int(res)))
     s1 = max(s0, min(n, (int(end) - int(w0) + int(res) - 1) // int(res)))
+    k_lo, k_hi = _parallel_k_bounds(
+        n, near_diag=near_diag, min_k_frac=min_k_frac, max_k_frac=max_k_frac
+    )
     best_k = None
     best_sc = -1.0
-    for k in range(int(near_diag) + 1, n - 1):
+    for k in range(k_lo, k_hi):
         d_pos = np.asarray(np.diag(W, k), dtype=float)
         d_neg = np.asarray(np.diag(W, -k), dtype=float)
         if d_pos.size < 3:
@@ -2509,12 +2549,16 @@ def parallel_stripe_mapped_inbox_frac(
     res,
     near_diag=2,
     thr_frac=0.15,
+    max_k_frac=0.45,
 ):
     """
     Project paired ±k parallel stripes from a flank window onto the call.
 
     Only offsets k >= |call|/2 are scored — those cannot fit inside S, so
     S-internal parallel_diag misses them (INV13: k≈1.4 Mb on a 1.2 Mb box).
+
+    Skip k ≈ |call| (lights both INV breakpoints / bowtie, not a stripe)
+    and k beyond max_k_frac of the window.
 
     For each such k: mark call bins that are an endpoint of an ON cell on
     +k / -k; mapped length = first→last hit span / |call|. Return
@@ -2537,9 +2581,15 @@ def parallel_stripe_mapped_inbox_frac(
     # ponytail: skip near-diag k; only stripes too wide for S (ceiling:
     # misses a short in-box stripe that also leaks outside — s_len covers that)
     k_lo = max(int(near_diag) + 1, n_call // 2)
+    k_hi = min(n - 1, max(k_lo + 1, int(np.floor(float(max_k_frac) * n))))
+    # skip k ≈ |S|: constant-offset link between the two INV ends
+    k_bow_lo = int(np.floor(0.75 * n_call))
+    k_bow_hi = int(np.ceil(1.25 * n_call))
     best = 0.0
     best_k = None
-    for k in range(k_lo, n - 1):
+    for k in range(k_lo, k_hi):
+        if k_bow_lo <= k <= k_bow_hi:
+            continue
         scores = []
         for sign in (1, -1):
             d = np.asarray(np.diag(W, sign * k), dtype=float)
@@ -2552,6 +2602,10 @@ def parallel_stripe_mapped_inbox_frac(
                     if s0 <= p < s1:
                         hit[p - s0] = True
             if not hit.any():
+                scores.append(0.0)
+                continue
+            # require some density, not two sparse endpoint hits
+            if float(hit.mean()) < 0.10:
                 scores.append(0.0)
                 continue
             idx = np.flatnonzero(hit)
@@ -2578,6 +2632,14 @@ def _parallel_diag_selfcheck():
         dash[i + 12, i] = 9.0
     dfrac, _ = s_matrix_parallel_length_frac(dash)
     assert 0.05 <= dfrac <= 0.5, dfrac
+    # near-diag thickness must NOT look like a parallel stripe (INV0 false +)
+    thick = np.eye(n) * 10.0
+    for off in (1, 2, 3):
+        for i in range(n - off):
+            thick[i, i + off] = 6.0
+            thick[i + off, i] = 6.0
+    tfrac, tk = s_matrix_parallel_length_frac(thick)
+    assert (not np.isfinite(tfrac)) or tfrac < 0.30, (tfrac, tk)
     # INV13-like: call too small for k, stripe hits both arms → mapped≈1
     W = np.eye(80) * 10.0
     # call bins [30, 42); stripe k=20 hits left arm + right-outside and
@@ -2589,6 +2651,12 @@ def _parallel_diag_selfcheck():
         W, w0=0, start=30, end=42, res=1, thr_frac=0.15
     )
     assert mk == 20 and mapped >= 0.5, (mapped, mk)
+    # k ≈ |call| bowtie link must not count as mapped parallel stripe
+    bow = np.eye(80) * 10.0
+    mapped_b, _ = parallel_stripe_mapped_inbox_frac(
+        bow, w0=0, start=20, end=60, res=1, thr_frac=0.15
+    )
+    assert mapped_b < 0.5, mapped_b
 
 
 def filter_parallel_stripe_calls(
@@ -4082,7 +4150,7 @@ def diagnose_region(mcool_file, region, res=50_000, balance=False, outdir="diagn
         res=res,
         min_block=500_000,
         radius=8,
-        direction_lambda=0.5,
+        direction_lambda=2.0,
         louvain_resolution=1.0,
         secondary_louvain_resolution=2.0,
         secondary_split_min_size=3_000_000,
@@ -6159,6 +6227,11 @@ def parse_workflow_args():
         )
     )
     parser.add_argument(
+        "--no-plot",
+        action="store_true",
+        help="skip Hi-C image rendering after detection (grid-search speed)"
+    )
+    parser.add_argument(
         "--diagnose-region",
         default=None,
         metavar="CHROM[:START-END]",
@@ -6258,6 +6331,33 @@ def parse_workflow_args():
         )
     )
     parser.add_argument(
+        "--offdiag-fill-max",
+        type=float,
+        default=0.25,
+        help=(
+            "max mean(|i-j|>=3)/mean(1<=|i-j|<=2) inside S; rejects blocky "
+            "fill (default: 0.25; <=0 disables)"
+        )
+    )
+    parser.add_argument(
+        "--direction-lambda",
+        type=float,
+        default=0.5,
+        help=(
+            "adjacent-edge direction fusion strength in Louvain graph "
+            "(default: 0.5)"
+        )
+    )
+    parser.add_argument(
+        "--secondary-louvain-resolution",
+        type=float,
+        default=2.0,
+        help=(
+            "Louvain resolution for secondary split of large failed blocks "
+            "(default: 2.0; <=0 disables secondary split)"
+        )
+    )
+    parser.add_argument(
         "--parallel-mass-frac-max",
         type=float,
         default=0.0,
@@ -6278,6 +6378,9 @@ def parse_workflow_args():
     args.s_anti_diag_min=float(args.s_anti_diag_min)
     args.flip_improve_min=float(args.flip_improve_min)
     args.parallel_diag_max=float(args.parallel_diag_max)
+    args.offdiag_fill_max=float(args.offdiag_fill_max)
+    args.direction_lambda=float(args.direction_lambda)
+    args.secondary_louvain_resolution=float(args.secondary_louvain_resolution)
     args.parallel_mass_frac_max=float(args.parallel_mass_frac_max)
     # kebab → snake aliases used by original_detection_command
     args.tip_anti_diag_min_size=3_000_000
@@ -6331,8 +6434,8 @@ def original_detection_command(
         "--corner_enrichment_max","5.0",
         "--corner_diag_bg_min","0",
         "--lattice_peak_max","0.30",
-        "--parallel_diag_max","0.30",
-        "--offdiag_fill_max","0.25",
+        "--parallel_diag_max",str(getattr(args,"parallel_diag_max",0.30)),
+        "--offdiag_fill_max",str(getattr(args,"offdiag_fill_max",0.25)),
         "--s_qc_resolution","50000",
         "--min_s_occupancy","0.60",
         "--max_s_gap_frac","0.25",
@@ -6371,7 +6474,10 @@ def original_detection_command(
         "--oneside_min_size","8000000",
         "--gcor_max_gap_bp","2000000",
         "--gap_cluster_diag_frac","0.35",
-        "--secondary_louvain_resolution","2.0",
+        "--direction_lambda",str(getattr(args,"direction_lambda",0.5)),
+        "--secondary_louvain_resolution",str(
+            getattr(args,"secondary_louvain_resolution",2.0)
+        ),
         "--secondary_split_min_size","3000000",
         ("--balance" if getattr(args,"balance",False) else "--no-balance"),
     ]
@@ -7452,11 +7558,13 @@ def workflow_main():
     else:
         result.to_csv(result_path,sep="\t",index=False)
 
-    if not result.empty:
+    if not result.empty and not bool(getattr(args, "no_plot", False)):
         render_hic_images(
             args.mcool_file,result,resolutions,outdir,
             balance=bool(args.balance)
         )
+    elif bool(getattr(args, "no_plot", False)):
+        print("[INFO] --no-plot: skip Hi-C image rendering", flush=True)
     print(
         f"[DONE] {len(result)} supported inversions -> {result_path}",
         flush=True
