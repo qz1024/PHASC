@@ -54,7 +54,10 @@ which chromap cooler
 ./phasc inversion preprocess_out/sample.mcool --outdir INV_results
 
 # 3. Detect intra-chromosomal translocations
-./phasc translocation preprocess_out/sample.mcool --output-dir TRA_results
+./phasc translocation --mcool preprocess_out/sample.mcool --outdir TRA_results --chrom chr3B
+
+# 4. Or run INV + TRA together
+./phasc pipeline preprocess_out/sample.mcool -o PHASC_results --jobs 4 --chromosomes chr3B
 ```
 
 
@@ -72,6 +75,7 @@ which chromap cooler
 | `preprocess`    | `preprocess.py`               | Map Hi-C with chromap → `.pairs` → genome-wide `.mcool` |
 | `inversion`     | `multiscale_inversion.py`     | Multi-scale inversion detection (Louvain / GCOR)        |
 | `translocation` | `multiscale_translocation.py` | Multi-scale intra-chromosomal translocation detection   |
+| `pipeline`      | `pipeline.py`                 | Run INV + TRA in parallel into one shared outdir        |
 
 
 
@@ -132,19 +136,51 @@ Optional refinement:
 
 ### `translocation`
 
-Detects intra-chromosomal translocation candidates across multiple Hi-C resolutions, then merges overlapping calls into consensus events.
+Detects intra-chromosomal translocation candidates across multiple Hi-C resolutions × Louvain gammas, then merges overlapping calls into consensus events.
 
 ```bash
-./phasc translocation preprocess_out/sample.mcool --output-dir TRA_results
+./phasc translocation \
+  --mcool preprocess_out/sample.mcool \
+  --outdir TRA_results \
+  --chrom chr3B \
+  --skip-plot
 ```
 
 Useful options:
 
-- `--chromosomes chr1,chr2` — restrict analysis to named chromosomes
-- `--resolutions auto` — or a comma-separated list such as `50000,100000,250000`
-- `--workers 4` — parallel scale processes
-- `--min-resolution-support 2` — minimum distinct resolutions supporting an event
-- `--no-balance` — use raw contact counts instead of balanced weights
+- `--chrom chr3B` — chromosome to analyze
+- `--resolutions 50000,100000,200000,500000` — Hi-C resolutions
+- `--gammas 0.5,0.75,1.0,1.25,1.5,2.0` — Louvain/PLM gammas
+- `--jobs 4` — parallel (resolution × gamma) workers
+- `--truth truth.bed` — optional evaluation against known TRA intervals
+- `--skip-plot` — skip community figure rendering
+
+
+### `pipeline`
+
+Runs inversion and translocation in parallel, then writes both result tables (and a combined `ALL_SV.tsv`) into one shared `--outdir`.
+
+```bash
+./phasc pipeline preprocess_out/sample.mcool \
+  -o PHASC_results \
+  --jobs 4 \
+  --chromosomes chr3B
+```
+
+Useful options:
+
+- `--chromosomes chr3B` — chromosome passed to translocation (first name only)
+- `--inv-min-support 2` — inversion multiscale support threshold
+- `--truth truth.bed` — optional TRA truth BED for evaluation prints
+- `--tra-skip-plot` / `--no-tra-skip-plot` — control TRA community plots
+- `--keep-work` — retain `outdir/.pipeline_work` for debugging
+
+Main outputs:
+
+- `ALL_INV_multiscale.tsv` — inversion calls
+- `ALL_TRA.tsv` / `merged_true_calls.tsv` — translocation calls
+- `ALL_SV.tsv` — combined INV + TRA table
+- `HiC_images/` — inversion Hi-C panels
 
 
 ## License

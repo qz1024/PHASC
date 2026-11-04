@@ -3319,7 +3319,7 @@ def detect_block_INV(
             right_matrix=np.hstack(right_parts)
 
 
-        low_frac=float(getattr(args,"gcor_low_signal_frac",0.3))
+        low_frac=float(getattr(args,"gcor_low_signal_frac",0.0))
         if need_left:
             left_matrix=filter_low_signal_axes(
                 left_matrix, mean_frac=low_frac
@@ -3555,7 +3555,7 @@ def detect_block_INV(
     if parallel_max>0 and np.isfinite(parallel_diag):
         parallel_pass=int(parallel_diag<=parallel_max)
 
-    fill_max=float(getattr(args, "offdiag_fill_max", 0.25))
+    fill_max=float(getattr(args, "offdiag_fill_max", 0.0))
     offdiag_fill=s_matrix_offdiag_fill_ratio(s_mat)
     fill_pass=1
     if fill_max>0 and np.isfinite(offdiag_fill):
@@ -3609,7 +3609,7 @@ def detect_block_INV(
 
     # Internal INV must show a bowtie inside S, not only flank GCOR orientation.
     # Tip oneside is exempt: sparse tips use --tip_anti_diag_rescue instead.
-    anti_min=float(getattr(args, "s_anti_diag_min", 2.0))
+    anti_min=float(getattr(args, "s_anti_diag_min", 0.0))
     band=int(getattr(args, "corner_band_bins", 2))
     s_anti_ratio,s_anti_mean,s_diag_mean=s_matrix_anti_diag_bg_ratio(
         s_signal, band=band
@@ -3663,7 +3663,7 @@ def detect_block_INV(
             right_span=right_blocks[-1][1]-right_blocks[0][0]
             if left_span<flank_bp or right_span<flank_bp:
                 continue
-            low_frac=float(getattr(args,"gcor_low_signal_frac",0.3))
+            low_frac=float(getattr(args,"gcor_low_signal_frac",0.0))
             if fail_left:
                 parts=[
                     get_block_matrix(hic,block,target,args.res,gm)
@@ -3747,7 +3747,7 @@ def detect_block_INV(
 
     # Flip-S only if every cheaper gate already passes. Local window only
     # (see flip_improvement_score) — never copy the whole chrom matrix.
-    flip_min=float(getattr(args, "flip_improve_min", 0.2))
+    flip_min=float(getattr(args, "flip_improve_min", 0.0))
     flip_delta=float("nan")
     flip_before=float("nan")
     flip_after=float("nan")
@@ -4042,7 +4042,7 @@ def _tip_anti_diag_grow_rescue(
     if abs(int(blocks[-1][1]) - chrom_length_bp) <= tip_tol:
         edges.append("left")
 
-    flip_min = float(getattr(args, "flip_improve_min", 0.2))
+    flip_min = float(getattr(args, "flip_improve_min", 0.0))
 
     for edge in edges:
         best = _scan(edge)
@@ -4165,12 +4165,12 @@ def diagnose_region(mcool_file, region, res=50_000, balance=False, outdir="diagn
         corner_diag_bg_min=0.0,
         lattice_peak_max=0.30,
         parallel_diag_max=0.30,
-        offdiag_fill_max=0.25,
+        offdiag_fill_max=0.0,
         min_s_occupancy=0.60,
         max_s_gap_frac=0.25,
-        s_anti_diag_min=2.0,
-        flip_improve_min=0.2,
-        gcor_low_signal_frac=0.3,
+        s_anti_diag_min=0.0,
+        flip_improve_min=0.0,
+        gcor_low_signal_frac=0.0,
         tip_min_s_occupancy=0.15,
         tip_max_s_gap_frac=0.70,
         tip_allow_nan_corner=True,
@@ -6297,27 +6297,30 @@ def parse_workflow_args():
     parser.add_argument(
         "--gcor-low-signal-frac",
         type=float,
-        default=0.3,
+        default=0.0,
         help=(
             "drop flank×S rows/cols with mean < frac×median before GCOR "
-            "(default: 0.3; <=0 off)"
+            "(default: 0.0; <=0 off). Was tightened to 0.3 in a later "
+            "revision and zeroed all sim INV calls; keep off by default."
         )
     )
     parser.add_argument(
         "--s-anti-diag-min",
         type=float,
-        default=2.0,
+        default=0.0,
         help=(
-            "min S×S anti/bg ratio for internal INV (default: 2.0; <=0 off)"
+            "min S×S anti/bg ratio for internal INV (default: 0.0=off). "
+            "Global anti-diag gating wiped sim INV; use per-call small-INV "
+            "logic / tip rescue instead."
         )
     )
     parser.add_argument(
         "--flip-improve-min",
         type=float,
-        default=0.2,
+        default=0.0,
         help=(
-            "min flip continuity delta to accept INV (default: 0.2; "
-            "< -1e8 disables)"
+            "min flip continuity delta to accept INV (default: 0.0; "
+            "< -1e8 disables). Match PHASC-main successful sim run."
         )
     )
     parser.add_argument(
@@ -6333,19 +6336,20 @@ def parse_workflow_args():
     parser.add_argument(
         "--offdiag-fill-max",
         type=float,
-        default=0.25,
+        default=0.0,
         help=(
             "max mean(|i-j|>=3)/mean(1<=|i-j|<=2) inside S; rejects blocky "
-            "fill (default: 0.25; <=0 disables)"
+            "fill (default: 0.0=off). Enabling at 0.25 zeroed sim INV merge."
         )
     )
     parser.add_argument(
         "--direction-lambda",
         type=float,
-        default=0.5,
+        default=2.0,
         help=(
             "adjacent-edge direction fusion strength in Louvain graph "
-            "(default: 0.5)"
+            "(default: 2.0; PHASC-main / working sim INV). 0.5 changes "
+            "communities enough that multiscale merge can become empty."
         )
     )
     parser.add_argument(
@@ -6435,7 +6439,7 @@ def original_detection_command(
         "--corner_diag_bg_min","0",
         "--lattice_peak_max","0.30",
         "--parallel_diag_max",str(getattr(args,"parallel_diag_max",0.30)),
-        "--offdiag_fill_max",str(getattr(args,"offdiag_fill_max",0.25)),
+        "--offdiag_fill_max",str(getattr(args,"offdiag_fill_max",0.0)),
         "--s_qc_resolution","50000",
         "--min_s_occupancy","0.60",
         "--max_s_gap_frac","0.25",
@@ -6465,16 +6469,16 @@ def original_detection_command(
             getattr(args,"large_tip_max_s_gap_frac",0.85)
         ),
         "--gcor_low_signal_frac",str(
-            getattr(args,"gcor_low_signal_frac",0.3)
+            getattr(args,"gcor_low_signal_frac",0.0)
         ),
-        "--s_anti_diag_min",str(getattr(args,"s_anti_diag_min",2.0)),
-        "--flip_improve_min",str(getattr(args,"flip_improve_min",0.2)),
+        "--s_anti_diag_min",str(getattr(args,"s_anti_diag_min",0.0)),
+        "--flip_improve_min",str(getattr(args,"flip_improve_min",0.0)),
         "--gap_oneside_min_frac","0.10",
         "--gap_oneside_corner_min","1.20",
         "--oneside_min_size","8000000",
         "--gcor_max_gap_bp","2000000",
         "--gap_cluster_diag_frac","0.35",
-        "--direction_lambda",str(getattr(args,"direction_lambda",0.5)),
+        "--direction_lambda",str(getattr(args,"direction_lambda",2.0)),
         "--secondary_louvain_resolution",str(
             getattr(args,"secondary_louvain_resolution",2.0)
         ),

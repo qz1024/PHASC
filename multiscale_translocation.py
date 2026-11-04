@@ -5,7 +5,7 @@
 One script, no other project imports. Flow:
 
   for Hi-C resolution in {50,100,200,500} kb:
-      for Louvain/PLM gamma in {0.5, 1.0, 1.5}:
+      for Louvain/PLM gamma in {0.5, 0.75, 1.0, 1.25, 1.5, 2.0}:
           cluster on top-10% contacts -> candidates -> clear-insert ILP
   merge across (resolution, gamma)
       - reciprocal overlap or smaller-contained-in-larger
@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import argparse
 import math
+import multiprocessing as mp
 import os
 import random
 import re
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import cooler
@@ -462,7 +464,7 @@ def _dense_matrix(clr: cooler.Cooler, chrom: str, balance: bool) -> np.ndarray:
 # project root (.../10.sim_inv_tra_compare) for default mcool/truth paths only
 ROOT = Path(__file__).resolve().parents[1]
 RESOLUTIONS_DEFAULT = (50_000, 100_000, 200_000, 500_000)
-GAMMAS_DEFAULT = (0.5, 1.0, 1.5)
+GAMMAS_DEFAULT = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
 
 # ---------------------------------------------------------------------------
 # Clear-insert ILP restore
@@ -767,7 +769,8 @@ def build_clear_insert_relations(
 
     i clearly fills a residual gap between two consecutive *same-label*
     community pieces. Mutual A<->B (A B C D -> A C B D: both views valid):
-    randomly keep one inserter, drop the other.
+    **report both** inserters (do not drop either). Evaluation treats either
+    (or both) as correct for the same TRA event.
     """
     merged_blocks = merged_blocks or {}
     fills: list[tuple[int, int, int, int]] = []
@@ -833,8 +836,7 @@ def build_clear_insert_relations(
                     fills.append((i, j, res_l, res_r))
                     fill_meta.append((i, j, res_l, res_r, ls, rs))
 
-    # Mutual A<->B: both views valid (A B C D -> A C B D).
-    # Randomly keep one inserter; drop the other. Eval treats either as TP.
+    # Mutual A<->B: both views valid (A B C D -> A C B D). Keep BOTH.
     pair_set = {(i, j) for i, j, _a, _b in fills}
     mutual_pairs: list[tuple[int, int]] = []
     seen_pair: set[tuple[int, int]] = set()
@@ -860,18 +862,15 @@ def build_clear_insert_relations(
         _boost, score, ls, rs, gl, gr = best
         return score, ls, rs, gl, gr
 
-    rng = random.Random(int(seed))
-    drop_inserters: set[int] = set()
+    # seed retained for API compat; no longer used to drop one side
+    _ = int(seed)
     mutual_records: list[dict] = []
     for a, b in mutual_pairs:
         sa, lsa, rsa, gla, gra = _best_flank_score(a, b)
         sb, lsb, rsb, glb, grb = _best_flank_score(b, a)
-        keep = rng.choice([a, b])
-        drop = b if keep == a else a
-        drop_inserters.add(drop)
-        for idx, score, ls, rs, gl, gr, other, decision in (
-            (a, sa, lsa, rsa, gla, gra, b, "keep" if keep == a else "drop"),
-            (b, sb, lsb, rsb, glb, grb, a, "keep" if keep == b else "drop"),
+        for idx, score, ls, rs, gl, gr, other in (
+            (a, sa, lsa, rsa, gla, gra, b),
+            (b, sb, lsb, rsb, glb, grb, a),
         ):
             r = rows[idx]
             o = rows[other]
@@ -894,12 +893,11 @@ def build_clear_insert_relations(
                     "other_start": int(o["start"]),
                     "other_end": int(o["end"]),
                     "other_cluster_id": int(o.get("cluster_id", other + 1)),
-                    "mutual_decision": decision,
+                    "mutual_decision": "keep",
                 }
             )
 
-    if drop_inserters:
-        fills = [t for t in fills if t[0] not in drop_inserters]
+    # Do not filter fills: both mutual inserters stay eligible for ILP accept.
     return fills, mutual_records
 
 
@@ -1109,26 +1107,21 @@ def resolve_persistent_mutuals(
     true_tables: dict,
     min_rec: float = 0.5,
 ) -> tuple[pd.DataFrame, int]:
-    """Final pass after all per-scale files are written.
+    """Final pass: ensure *both* sides of mutual-insert pairs are reported.
 
-    Find intervals that kept being mutually insertable. Merge near-identical
-    intervals across scales, then for each mutual pair pick the side with
-    the longer adjacent community (max flank_score seen). That side is TRA:
-
-    - demote the other side if it was called true
-    - if the TRA side was never true at any scale → recover it
+    A B C D -> A C B D: B and C are mutually insertable. Recover any side that
+    never became ``true`` at any scale. Never demote the other side.
+    Returns (recovered_rows, n_demote) with n_demote always 0.
     """
     empty = pd.DataFrame()
     if not mutual_records:
         return empty, 0
 
-    # --- cluster near-identical intervals across scales ---
     ivs: list[tuple[str, int, int]] = []
     for rec in mutual_records:
         chrom = str(rec["chrom"])
         ivs.append((chrom, int(rec["start"]), int(rec["end"])))
         ivs.append((chrom, int(rec["other_start"]), int(rec["other_end"])))
-    # unique preserve order
     uniq: list[tuple[str, int, int]] = []
     seen_iv: set[tuple[str, int, int]] = set()
     for iv in ivs:
@@ -1156,7 +1149,6 @@ def resolve_persistent_mutuals(
             if _reciprocal(uniq[i][1], uniq[i][2], uniq[j][1], uniq[j][2]) >= min_rec:
                 union(i, j)
 
-    # root → representative interval = longest member; best record per root
     members: dict[int, list[int]] = {}
     for i in range(len(uniq)):
         members.setdefault(find(i), []).append(i)
@@ -1173,9 +1165,7 @@ def resolve_persistent_mutuals(
                 return find(i)
         return None
 
-    # per cluster: best flank_score record (as the inserter side)
     best_rec: dict[int, dict] = {}
-    # undirected mutual edges between clusters
     edges: set[tuple[int, int]] = set()
     for rec in mutual_records:
         chrom = str(rec["chrom"])
@@ -1202,60 +1192,124 @@ def resolve_persistent_mutuals(
                     return True
         return False
 
-    def demote(chrom: str, s: int, e: int) -> int:
-        n = 0
-        for df in true_tables.values():
-            if df is None or len(df) == 0 or "role" not in df.columns:
-                continue
-            for idx, r in df.iterrows():
-                if str(r.get("role")) != "true":
-                    continue
-                if str(r["chrom"]) != chrom:
-                    continue
-                if _reciprocal(int(r["start"]), int(r["end"]), s, e) >= min_rec:
-                    df.at[idx, "role"] = "reject"
-                    n += 1
-        return n
-
     recovered_rows: list[dict] = []
-    n_demote = 0
-    for ra, rb in sorted(edges):
-        rec_a = best_rec.get(ra)
-        rec_b = best_rec.get(rb)
-        if rec_a is None or rec_b is None:
+    roots_needed: set[int] = set()
+    for ra, rb in edges:
+        roots_needed.add(ra)
+        roots_needed.add(rb)
+
+    for root in sorted(roots_needed):
+        rec = best_rec.get(root)
+        if rec is None:
+            # fall back to representative interval only (no partner) — skip
             continue
-        # TRA = longer adjacent community
-        if int(rec_a["flank_score"]) >= int(rec_b["flank_score"]):
-            win_rec, lose_root = rec_a, rb
-        else:
-            win_rec, lose_root = rec_b, ra
-        lose_iv = rep_iv[lose_root]
-        n_demote += demote(lose_iv[0], lose_iv[1], lose_iv[2])
-        if covered(str(win_rec["chrom"]), int(win_rec["start"]), int(win_rec["end"])):
+        chrom = str(rec["chrom"])
+        s, e = int(rec["start"]), int(rec["end"])
+        if covered(chrom, s, e):
             continue
         recovered_rows.append(
             {
                 "cluster_id": 10_000 + len(recovered_rows) + 1,
-                "chrom": win_rec["chrom"],
-                "start": int(win_rec["start"]),
-                "end": int(win_rec["end"]),
-                "partner_start": int(win_rec["partner_start"]),
-                "partner_end": int(win_rec["partner_end"]),
-                "enrichment_fold": float(win_rec.get("enrichment_fold", 1.0)),
+                "chrom": chrom,
+                "start": s,
+                "end": e,
+                "partner_start": int(rec["partner_start"]),
+                "partner_end": int(rec["partner_end"]),
+                "enrichment_fold": float(rec.get("enrichment_fold", 1.0)),
                 "scale_support": 1,
-                "size": int(win_rec["end"]) - int(win_rec["start"]),
-                "partner_size": int(win_rec["partner_end"]) - int(win_rec["partner_start"]),
-                "label": int(win_rec.get("label", -1)),
+                "size": e - s,
+                "partner_size": int(rec["partner_end"]) - int(rec["partner_start"]),
+                "label": int(rec.get("label", -1)),
                 "role": "true",
-                "resolution": win_rec.get("resolution", -1),
-                "gamma": win_rec.get("gamma", float("nan")),
-                "recover_source": "mutual_longer_neighbor",
-                "flank_score": int(win_rec["flank_score"]),
+                "resolution": rec.get("resolution", -1),
+                "gamma": rec.get("gamma", float("nan")),
+                "recover_source": "mutual_both_sides",
+                "flank_score": int(rec["flank_score"]),
             }
         )
 
     recovered = pd.DataFrame(recovered_rows) if recovered_rows else empty
-    return recovered, n_demote
+    return recovered, 0
+
+
+def annotate_mutual_insert_on_merged(
+    merged: pd.DataFrame,
+    mutual_records: list[dict] | None,
+    min_rec: float = 0.5,
+) -> pd.DataFrame:
+    """Mark mutual-insert pairs on final TRA calls.
+
+    Adds columns:
+      mutual_insert      1 if call is one side of a mutual-insert pair
+      mutual_pair_id     shared id for the two sides (0 = not mutual)
+      mutual_eval_keep   1 = keep for eval; 0 = drop the duplicate side
+                         (prefer higher enrichment_fold, then larger size)
+      mutual_partner_start / mutual_partner_end  the other side's interval
+    Both sides stay in ALL_TRA; eval should drop rows with mutual_eval_keep==0.
+    """
+    out = merged.copy()
+    n = len(out)
+    out["mutual_insert"] = 0
+    out["mutual_pair_id"] = 0
+    out["mutual_eval_keep"] = 1
+    out["mutual_partner_start"] = -1
+    out["mutual_partner_end"] = -1
+    if n == 0 or not mutual_records:
+        return out
+
+    def _hit(s: int, e: int, chrom: str) -> int | None:
+        best_i, best_r = None, -1.0
+        for i in range(n):
+            if str(out.at[i, "chrom"]) != chrom:
+                continue
+            r = _reciprocal(s, e, int(out.at[i, "start"]), int(out.at[i, "end"]))
+            if r >= min_rec and r > best_r:
+                best_i, best_r = i, r
+        return best_i
+
+    # unique unordered pairs of call indices
+    pair_set: set[tuple[int, int]] = set()
+    pair_coords: dict[tuple[int, int], tuple[int, int, int, int]] = {}
+    for rec in mutual_records:
+        chrom = str(rec["chrom"])
+        ia = _hit(int(rec["start"]), int(rec["end"]), chrom)
+        ib = _hit(int(rec["other_start"]), int(rec["other_end"]), chrom)
+        if ia is None or ib is None or ia == ib:
+            continue
+        key = (ia, ib) if ia < ib else (ib, ia)
+        pair_set.add(key)
+        pair_coords[key] = (
+            int(out.at[key[0], "start"]),
+            int(out.at[key[0], "end"]),
+            int(out.at[key[1], "start"]),
+            int(out.at[key[1], "end"]),
+        )
+
+    for pid, (ia, ib) in enumerate(sorted(pair_set), start=1):
+        sa, ea = int(out.at[ia, "start"]), int(out.at[ia, "end"])
+        sb, eb = int(out.at[ib, "start"]), int(out.at[ib, "end"])
+        # Prefer larger arm (usually the donor), then enrichment / support.
+        score_a = (
+            ea - sa,
+            float(out.at[ia, "enrichment_fold"]),
+            int(out.at[ia, "scale_support"]) if "scale_support" in out.columns else 0,
+        )
+        score_b = (
+            eb - sb,
+            float(out.at[ib, "enrichment_fold"]),
+            int(out.at[ib, "scale_support"]) if "scale_support" in out.columns else 0,
+        )
+        keep_a = score_a >= score_b
+        for i, other_s, other_e, keep in (
+            (ia, sb, eb, keep_a),
+            (ib, sa, ea, not keep_a),
+        ):
+            out.at[i, "mutual_insert"] = 1
+            out.at[i, "mutual_pair_id"] = pid
+            out.at[i, "mutual_eval_keep"] = 1 if keep else 0
+            out.at[i, "mutual_partner_start"] = other_s
+            out.at[i, "mutual_partner_end"] = other_e
+    return out
 
 
 def recover_mutual_by_flank_score(
@@ -1276,10 +1330,8 @@ def suppress_mutual_losers_in_true_tables(
     mutual_records: list[dict],
     min_rec: float = 0.5,
 ) -> int:
-    _, n = resolve_persistent_mutuals(
-        mutual_records, true_tables, min_rec=min_rec
-    )
-    return n
+    """No-op: mutual-insert pairs are both kept (never demoted)."""
+    return 0
 
 
 def iterate_clear_insert(
@@ -1325,9 +1377,9 @@ def iterate_clear_insert(
                 rec = dict(rec)
                 rec["round"] = rnd
                 all_mutual.append(rec)
-            n_pairs = sum(1 for r in mutual_recs if r.get("mutual_decision") == "keep")
+            n_pairs = sum(1 for r in mutual_recs if r.get("mutual_decision") == "keep") // 2
             print(
-                f"[round {rnd}] mutual={n_pairs} pairs "
+                f"[round {rnd}] mutual={n_pairs} pairs (both sides kept) "
                 f"(randomly keep one side)",
                 flush=True,
             )
@@ -1932,19 +1984,23 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--mcool",
         type=Path,
-        default=ROOT / "01.PHASC/01.inv/chr3B_simINVTRA_10X_q0.mcool",
+        required=True,
+        help="input .mcool file",
     )
     ap.add_argument(
         "--truth",
         type=Path,
-        default=ROOT / "eval/truth_sim_coords.bed",
+        default=None,
+        help=(
+            "optional truth BED (chrom start end name size svtype status); "
+            "when set, print precision/recall against TRA rows"
+        ),
     )
     ap.add_argument(
         "--outdir",
         type=Path,
-        default=Path(__file__).resolve().parent
-        / "optimize_restore_out"
-        / "multiscale",
+        default=Path("TRA_results"),
+        help="output directory (default: TRA_results)",
     )
     ap.add_argument(
         "--resolutions",
@@ -1987,7 +2043,198 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="parallel (resolutionxgamma) workers (0=auto: cpu/2, 1=serial)",
     )
+    ap.add_argument(
+        "--threads",
+        type=int,
+        default=0,
+        help=(
+            "NetworKit PLM threads per scale (default: 0 = auto cpu/2; "
+            "set 1 for fully serial PLM)"
+        ),
+    )
     return ap
+
+
+def _run_one_res_gamma(payload: dict) -> dict:
+    """Worker for one (resolution, gamma): cluster → enrich → clear-insert.
+
+    Built for ProcessPoolExecutor (spawn). Rebuilds the Hi-C graph inside the
+    worker (NetworKit graphs are not reliably shareable across processes).
+    """
+    res = int(payload["resolution"])
+    gamma = float(payload["gamma"])
+    mcool = Path(payload["mcool"])
+    chrom = str(payload["chrom"])
+    chrom_size = int(payload["chrom_size"])
+    outdir = Path(payload["outdir"])
+    n_threads = int(payload["n_threads"])
+    edge_quantile = float(payload["edge_quantile"])
+    seed = int(payload["seed"])
+    min_segment_bp = int(payload["min_segment_bp"])
+    bridge_bp = int(payload["bridge_bp"])
+    min_true_fold = float(payload["min_true_fold"])
+    skip_enrichment = bool(payload["skip_enrichment"])
+    from_tsv = bool(payload["from_tsv"])
+    truth_path = payload.get("truth_path")
+
+    log_lines: list[str] = []
+
+    def log(msg: str) -> None:
+        log_lines.append(msg)
+
+    log(f"\n======== resolution {res}  gamma={gamma:g} ========")
+    cands = pd.DataFrame()
+    segments = pd.DataFrame()
+    nodes = edges = 0
+
+    if from_tsv:
+        ps = pd.read_csv(payload["per_scale"], sep="\t")
+        calls = per_scale_to_calls(ps, res)
+    else:
+        log(
+            f"[INFO] analyze_scale @ {res} g={gamma:g} "
+            f"(edge_quantile={edge_quantile}, plm=par=balanced, "
+            f"threads={n_threads}) ..."
+        )
+        _, _, nodes, edges, cands, segments = analyze_scale(
+            mcool,
+            chrom,
+            chrom_size,
+            res,
+            gamma,
+            edge_quantile,
+            False,
+            seed,
+            min_segment_bp,
+            bridge_bp,
+            n_threads,
+            plm_par="balanced",
+            seed_salt=0,
+            graph=None,
+        )
+        if "chrom" not in cands.columns:
+            cands = cands.copy()
+            cands["chrom"] = chrom
+        calls = candidates_to_calls(cands, chrom, res)
+
+    log(
+        f"[INFO] graph={nodes}/{edges} segments={len(segments)} "
+        f"candidates={len(calls)}"
+    )
+    if calls.empty:
+        return {
+            "resolution": res,
+            "gamma": gamma,
+            "empty": True,
+            "log": "\n".join(log_lines),
+        }
+
+    if not skip_enrichment:
+        calls = score_enrichment_for_calls(
+            calls, mcool, chrom, chrom_size, res, segments
+        )
+        log(
+            f"[INFO] enrichment fold median="
+            f"{calls['enrichment_fold'].median():.3f} "
+            f"max={calls['enrichment_fold'].max():.3f}"
+        )
+
+    tag = f"r{res}_g{gamma:g}"
+    res_dir = outdir / tag
+    res_dir.mkdir(parents=True, exist_ok=True)
+    calls.to_csv(res_dir / "calls_input.tsv", sep="\t", index=False)
+    if not from_tsv and len(cands):
+        cands.to_csv(res_dir / "scale_candidates.tsv", sep="\t", index=False)
+
+    out, history, units, mutual_recs = iterate_clear_insert(
+        calls,
+        min_true_fold=min_true_fold,
+        seed=seed,
+    )
+    out = out.copy()
+    out["gamma"] = gamma
+    out.to_csv(res_dir / "iterative_restore_calls.tsv", sep="\t", index=False)
+    pd.DataFrame(history).to_csv(res_dir / "round_history.tsv", sep="\t", index=False)
+    if units:
+        pd.DataFrame(units).to_csv(res_dir / "merged_units.tsv", sep="\t", index=False)
+
+    mutual_out: list[dict] = []
+    if mutual_recs:
+        for rec in mutual_recs:
+            rec = dict(rec)
+            rec["resolution"] = res
+            rec["gamma"] = gamma
+            mutual_out.append(rec)
+        pd.DataFrame(mutual_recs).assign(resolution=res, gamma=gamma).to_csv(
+            res_dir / "mutual_dropped.tsv", sep="\t", index=False
+        )
+
+    role_counts = out["role"].value_counts().to_dict()
+    tr = out[out["role"] == "true"].copy()
+    if truth_path:
+        truth = pd.read_csv(
+            truth_path,
+            sep="\t",
+            header=None,
+            names=["chrom", "start", "end", "name", "size", "svtype", "status"],
+        )
+        ev = evaluate_against_truth(tr, truth) if len(tr) else {
+            "tp": 0,
+            "fp": 0,
+            "fn": int((truth.svtype == "TRA").sum()),
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "matched": [],
+            "fn_names": [],
+            "details": [],
+        }
+        log(
+            f"[RES {res} g={gamma:g}] roles={role_counts}  "
+            f"P={ev['precision']:.3f} R={ev['recall']:.3f} "
+            f"F1={ev['f1']:.3f} TP={ev['tp']} FP={ev['fp']}"
+        )
+        for cid, name, rec, tag_ev in ev.get("details") or []:
+            log(f"  {tag_ev} c{cid} -> {name}:{rec}")
+    else:
+        ev = {
+            "tp": "",
+            "fp": "",
+            "precision": "",
+            "recall": "",
+            "f1": "",
+            "matched": [],
+        }
+        log(
+            f"[RES {res} g={gamma:g}] roles={role_counts}  "
+            f"n_true={int(role_counts.get('true', 0))}"
+        )
+
+    summary = {
+        "resolution": res,
+        "gamma": gamma,
+        "n_candidates": len(calls),
+        "n_true": int(role_counts.get("true", 0)),
+        "n_shadow": int(role_counts.get("shadow", 0)),
+        "n_reject": int(role_counts.get("reject", 0)),
+        "tp": ev["tp"],
+        "fp": ev["fp"],
+        "precision": ev["precision"],
+        "recall": ev["recall"],
+        "f1": ev["f1"],
+        "matched": ",".join(ev["matched"]),
+    }
+    return {
+        "resolution": res,
+        "gamma": gamma,
+        "empty": False,
+        "out": out,
+        "cands": cands if not from_tsv else pd.DataFrame(),
+        "mutual_recs": mutual_out,
+        "summary": summary,
+        "segments": segments,
+        "log": "\n".join(log_lines),
+    }
 
 
 def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
@@ -2004,18 +2251,41 @@ def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
     community_dir = args.outdir / "community"
     community_dir.mkdir(parents=True, exist_ok=True)
 
-    ps = pd.read_csv(args.per_scale, sep="\t") if args.from_tsv else None
-    truth = pd.read_csv(
-        args.truth,
-        sep="\t",
-        header=None,
-        names=["chrom", "start", "end", "name", "size", "svtype", "status"],
-    )
+    if args.truth is not None:
+        truth = pd.read_csv(
+            args.truth,
+            sep="\t",
+            header=None,
+            names=["chrom", "start", "end", "name", "size", "svtype", "status"],
+        )
+    else:
+        truth = pd.DataFrame(
+            columns=["chrom", "start", "end", "name", "size", "svtype", "status"]
+        )
 
     available = discover_resolutions(args.mcool)
-    clr0 = cooler.Cooler(f"{args.mcool}::/resolutions/{resolutions[0]}")
+    use_resolutions = [r for r in resolutions if r in available]
+    for r in resolutions:
+        if r not in available:
+            print(f"[WARN] resolution {r} not in mcool; skip", flush=True)
+    if not use_resolutions:
+        raise SystemExit("[ERROR] no requested resolutions present in mcool")
+
+    clr0 = cooler.Cooler(f"{args.mcool}::/resolutions/{use_resolutions[0]}")
     chrom_size = int(clr0.chromsizes.loc[args.chrom])
-    n_threads = max(1, (os.cpu_count() or 4) // 2)
+
+    n_tasks = len(use_resolutions) * len(gammas)
+    if int(getattr(args, "jobs", 0) or 0) > 0:
+        n_jobs = int(args.jobs)
+    else:
+        n_jobs = max(1, (os.cpu_count() or 4) // 2)
+    n_jobs = max(1, min(n_jobs, n_tasks))
+
+    if int(getattr(args, "threads", 0) or 0) > 0:
+        n_threads = int(args.threads)
+    else:
+        # avoid oversubscription when many (res,gamma) workers run at once
+        n_threads = max(1, (os.cpu_count() or 4) // max(1, n_jobs))
 
     true_tables: dict = {}
     summary_rows = []
@@ -2023,187 +2293,134 @@ def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
     all_mutual_records: list[dict] = []
 
     print(
-        f"[INFO] scales: resolutions={resolutions} gammas={gammas} "
-        f"edge_quantile={args.edge_quantile} threads={n_threads} seed={args.seed}",
+        f"[INFO] scales: resolutions={use_resolutions} gammas={gammas} "
+        f"edge_quantile={args.edge_quantile} jobs={n_jobs} "
+        f"threads/worker={n_threads} seed={args.seed}",
         flush=True,
     )
 
-    graph_cache: dict[int, "nk.graph.Graph"] = {}
-
-    for res in resolutions:
-        if res not in available:
-            print(f"[WARN] resolution {res} not in mcool; skip", flush=True)
-            continue
-        if not args.from_tsv:
-            print(
-                f"[INFO] build contact graph @ {res} "
-                f"(edge_quantile={args.edge_quantile}) ...",
-                flush=True,
-            )
-            graph_cache[res], g_nodes, g_edges = build_contact_graph(
-                args.mcool, args.chrom, res, args.edge_quantile, False
-            )
-            print(
-                f"[INFO] graph @ {res}: nodes={g_nodes} edges={g_edges}",
-                flush=True,
-            )
+    payloads = []
+    for res in use_resolutions:
         for gamma in gammas:
-            print(
-                f"\n======== resolution {res}  gamma={gamma:g} ========",
-                flush=True,
-            )
-            print(
-                f"[INFO] analyze_scale @ {res} g={gamma:g} "
-                f"(edge_quantile={args.edge_quantile}, plm=par=balanced) ...",
-                flush=True,
-            )
-
-            if args.from_tsv:
-                calls = per_scale_to_calls(ps, res)
-                segments = pd.DataFrame()
-                cands = pd.DataFrame()
-                nodes = edges = 0
-            else:
-                _, _, nodes, edges, cands, segments = analyze_scale(
-                    args.mcool,
-                    args.chrom,
-                    chrom_size,
-                    res,
-                    gamma,
-                    args.edge_quantile,
-                    False,
-                    args.seed,
-                    args.min_segment_bp,
-                    args.bridge_bp,
-                    n_threads,
-                    plm_par="balanced",
-                    seed_salt=0,
-                    graph=graph_cache[res],
-                )
-                if "chrom" not in cands.columns:
-                    cands = cands.copy()
-                    cands["chrom"] = args.chrom
-                all_cands_frames.append(cands)
-                calls = candidates_to_calls(cands, args.chrom, res)
-
-            print(
-                f"[INFO] graph={nodes}/{edges} segments={len(segments)} "
-                f"candidates={len(calls)}",
-                flush=True,
-            )
-            if calls.empty:
-                continue
-
-            if not args.skip_enrichment:
-                calls = score_enrichment_for_calls(
-                    calls, args.mcool, args.chrom, chrom_size, res, segments
-                )
-                print(
-                    f"[INFO] enrichment fold median="
-                    f"{calls['enrichment_fold'].median():.3f} "
-                    f"max={calls['enrichment_fold'].max():.3f}",
-                    flush=True,
-                )
-
-            tag = f"r{res}_g{gamma:g}"
-            res_dir = args.outdir / tag
-            res_dir.mkdir(parents=True, exist_ok=True)
-            calls.to_csv(res_dir / "calls_input.tsv", sep="\t", index=False)
-            if not args.from_tsv and len(cands):
-                cands.to_csv(res_dir / "scale_candidates.tsv", sep="\t", index=False)
-
-            out, history, units, mutual_recs = iterate_clear_insert(
-                calls,
-                min_true_fold=args.min_true_fold,
-                seed=args.seed,
-            )
-            out = out.copy()
-            out["gamma"] = gamma
-            out.to_csv(
-                res_dir / "iterative_restore_calls.tsv", sep="\t", index=False
-            )
-            pd.DataFrame(history).to_csv(
-                res_dir / "round_history.tsv", sep="\t", index=False
-            )
-            if units:
-                pd.DataFrame(units).to_csv(
-                    res_dir / "merged_units.tsv", sep="\t", index=False
-                )
-            if mutual_recs:
-                for rec in mutual_recs:
-                    rec = dict(rec)
-                    rec["resolution"] = res
-                    rec["gamma"] = gamma
-                    all_mutual_records.append(rec)
-                pd.DataFrame(mutual_recs).assign(
-                    resolution=res, gamma=gamma
-                ).to_csv(res_dir / "mutual_dropped.tsv", sep="\t", index=False)
-
-            role_counts = out["role"].value_counts().to_dict()
-            tr = out[out["role"] == "true"].copy()
-            true_tables[(res, gamma)] = out
-            ev = evaluate_against_truth(tr, truth) if len(tr) else {
-                "tp": 0, "fp": 0, "fn": int((truth.svtype == "TRA").sum()),
-                "precision": 0.0, "recall": 0.0, "f1": 0.0,
-                "matched": [], "fn_names": [], "details": [],
-            }
-            print(
-                f"[RES {res} g={gamma:g}] roles={role_counts}  "
-                f"P={ev['precision']:.3f} R={ev['recall']:.3f} "
-                f"F1={ev['f1']:.3f} TP={ev['tp']} FP={ev['fp']}",
-                flush=True,
-            )
-            if ev["details"]:
-                for cid, name, rec, tag_ev in ev["details"]:
-                    print(f"  {tag_ev} c{cid} -> {name}:{rec}", flush=True)
-
-            summary_rows.append(
+            payloads.append(
                 {
                     "resolution": res,
                     "gamma": gamma,
-                    "n_candidates": len(calls),
-                    "n_true": int(role_counts.get("true", 0)),
-                    "n_shadow": int(role_counts.get("shadow", 0)),
-                    "n_reject": int(role_counts.get("reject", 0)),
-                    "tp": ev["tp"],
-                    "fp": ev["fp"],
-                    "precision": ev["precision"],
-                    "recall": ev["recall"],
-                    "f1": ev["f1"],
-                    "matched": ",".join(ev["matched"]),
+                    "mcool": str(args.mcool),
+                    "chrom": args.chrom,
+                    "chrom_size": chrom_size,
+                    "outdir": str(args.outdir),
+                    "n_threads": n_threads,
+                    "edge_quantile": float(args.edge_quantile),
+                    "seed": int(args.seed),
+                    "min_segment_bp": int(args.min_segment_bp),
+                    "bridge_bp": int(args.bridge_bp),
+                    "min_true_fold": float(args.min_true_fold),
+                    "skip_enrichment": bool(args.skip_enrichment),
+                    "from_tsv": bool(args.from_tsv),
+                    "per_scale": str(args.per_scale) if args.from_tsv else "",
+                    "truth_path": str(args.truth) if args.truth is not None else None,
                 }
             )
 
-            if not args.skip_plot:
-                plot_resolution_community(
-                    args.mcool,
-                    args.chrom,
-                    chrom_size,
-                    res,
-                    segments,
-                    tr,
-                    truth,
-                    community_dir / f"community_opt_chr3B_{tag}.png",
-                )
+    results: list[dict] = []
+    if n_jobs == 1:
+        for payload in payloads:
+            results.append(_run_one_res_gamma(payload))
+    else:
+        print(
+            f"[INFO] parallel (resolution x gamma): {n_tasks} tasks, "
+            f"{n_jobs} workers",
+            flush=True,
+        )
+        with ProcessPoolExecutor(
+            max_workers=n_jobs, mp_context=mp.get_context("spawn")
+        ) as ex:
+            futs = {ex.submit(_run_one_res_gamma, p): p for p in payloads}
+            for fut in as_completed(futs):
+                results.append(fut.result())
+
+    # stable order for logs / merge
+    results.sort(key=lambda r: (int(r["resolution"]), float(r["gamma"])))
+    for result in results:
+        print(result.get("log", ""), flush=True)
+        if result.get("empty"):
+            continue
+        res = int(result["resolution"])
+        gamma = float(result["gamma"])
+        out = result["out"]
+        true_tables[(res, gamma)] = out
+        summary_rows.append(result["summary"])
+        if result.get("cands") is not None and len(result["cands"]):
+            all_cands_frames.append(result["cands"])
+        if result.get("mutual_recs"):
+            all_mutual_records.extend(result["mutual_recs"])
+        if not args.skip_plot:
+            tr = out[out["role"] == "true"].copy()
+            tag = f"r{res}_g{gamma:g}"
+            plot_resolution_community(
+                args.mcool,
+                args.chrom,
+                chrom_size,
+                res,
+                result.get("segments", pd.DataFrame()),
+                tr,
+                truth,
+                community_dir / f"community_opt_{args.chrom}_{tag}.png",
+            )
 
     if all_mutual_records:
         pd.DataFrame(all_mutual_records).to_csv(
+            args.outdir / "mutual_pairs_all.tsv", sep="\t", index=False
+        )
+        # also keep legacy filename for downstream scripts
+        pd.DataFrame(all_mutual_records).to_csv(
             args.outdir / "mutual_dropped_all.tsv", sep="\t", index=False
         )
+        # Recover any mutual-insert side that never became role=true
+        recovered, _ = resolve_persistent_mutuals(
+            all_mutual_records, true_tables, min_rec=args.merge_min_rec
+        )
+        if len(recovered):
+            print(
+                f"[INFO] mutual recover both sides: {len(recovered)} calls",
+                flush=True,
+            )
+            # numeric key so merge_true_across_resolutions sort stays valid
+            true_tables[(-1, 0.0)] = recovered
 
     # merge across resolutions
     merged = merge_true_across_resolutions(
         true_tables,
         min_rec=args.merge_min_rec,
     )
+    if len(merged):
+        merged = annotate_mutual_insert_on_merged(
+            merged, all_mutual_records, min_rec=args.merge_min_rec
+        )
+        n_mutual = int((merged["mutual_insert"] == 1).sum()) if "mutual_insert" in merged.columns else 0
+        n_drop = int((merged["mutual_eval_keep"] == 0).sum()) if "mutual_eval_keep" in merged.columns else 0
+        if n_mutual:
+            print(
+                f"[INFO] mutual-insert marked: {n_mutual} calls "
+                f"({n_drop} secondary for eval drop)",
+                flush=True,
+            )
     merged_path = args.outdir / "merged_true_calls.tsv"
     if len(merged):
+        if "size" not in merged.columns and {"start", "end"} <= set(merged.columns):
+            merged = merged.copy()
+            merged["size"] = merged["end"].astype(int) - merged["start"].astype(int)
         merged.to_csv(merged_path, sep="\t", index=False)
+        # PHASC-style alias for pipeline / downstream tools
+        merged.to_csv(args.outdir / "ALL_TRA.tsv", sep="\t", index=False)
     else:
         pd.DataFrame().to_csv(merged_path, sep="\t", index=False)
+        pd.DataFrame().to_csv(args.outdir / "ALL_TRA.tsv", sep="\t", index=False)
     print(f"\n[INFO] merged true calls: {len(merged)} -> {merged_path}", flush=True)
+    print(f"[INFO] ALL_TRA.tsv -> {args.outdir / 'ALL_TRA.tsv'}", flush=True)
 
-    if len(merged):
+    if len(merged) and args.truth is not None:
         mev = evaluate_against_truth(merged, truth)
         print(
             f"[MERGED] P={mev['precision']:.3f} R={mev['recall']:.3f} F1={mev['f1']:.3f} "
@@ -2239,6 +2456,27 @@ def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
                 "recall": mev["recall"],
                 "f1": mev["f1"],
                 "matched": ",".join(mev["matched"]),
+            }
+        )
+    elif len(merged):
+        summary_rows.append(
+            {
+                "resolution": "MERGED",
+                "gamma": ",".join(f"{g:g}" for g in gammas),
+                "n_candidates": sum(
+                    int(s["n_candidates"])
+                    for s in summary_rows
+                    if s["resolution"] != "MERGED"
+                ),
+                "n_true": len(merged),
+                "n_shadow": "",
+                "n_reject": "",
+                "tp": "",
+                "fp": "",
+                "precision": "",
+                "recall": "",
+                "f1": "",
+                "matched": "",
             }
         )
 
