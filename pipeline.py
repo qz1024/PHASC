@@ -71,6 +71,8 @@ def _promote_translocation(work: Path, outdir: Path) -> list[str]:
     promoted: list[str] = []
     names = (
         "ALL_TRA.tsv",
+        "ALL_TRA_pre_enrichment.tsv",
+        "ALL_TRA_enrichment_dropped.tsv",
         "merged_true_calls.tsv",
         "ALL_TRA_per_scale_candidates.tsv",
         "per_resolution_summary.tsv",
@@ -180,7 +182,6 @@ def _merge_sv_tables(outdir: Path) -> Path | None:
             "cluster_id",
             "mutual_insert",
             "mutual_pair_id",
-            "mutual_eval_keep",
             "mutual_partner_start",
             "mutual_partner_end",
         ):
@@ -286,6 +287,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional TRA --gammas (comma-separated)",
     )
     parser.add_argument(
+        "--min-enrichment-fold",
+        type=float,
+        default=1.5,
+        help=(
+            "TRA final enrichment gate after clear-insert merge "
+            "(enrichment_fold > threshold; default: 1.5; <=0 disables)"
+        ),
+    )
+    parser.add_argument(
+        "--tip-window-bp",
+        type=int,
+        default=2_000_000,
+        help=(
+            "TRA breakpoint tip window for O/E enrichment_fold "
+            "(default: 2000000)"
+        ),
+    )
+    parser.add_argument(
         "--tra-threads",
         type=int,
         default=0,
@@ -377,6 +396,10 @@ def main(argv: list[str] | None = None) -> int:
         chrom,
         "--jobs",
         str(args.jobs),
+        "--min-enrichment-fold",
+        str(args.min_enrichment_fold),
+        "--tip-window-bp",
+        str(args.tip_window_bp),
     ]
     if args.tra_skip_plot:
         tra_cmd.append("--skip-plot")

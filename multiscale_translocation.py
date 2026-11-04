@@ -2,14 +2,21 @@
 # -*- coding: utf-8 -*-
 """Multi-resolution x multi-Louvain TRA detection (standalone).
 
-One script, no other project imports. Flow:
+One script, no other project imports. Default flow:
 
   for Hi-C resolution in {50,100,200,500} kb:
       for Louvain/PLM gamma in {0.5, 0.75, 1.0, 1.25, 1.5, 2.0}:
-          cluster on top-10% contacts -> candidates -> clear-insert ILP
+          cluster on top-10% contacts -> score enrichment -> clear-insert ILP
   merge across (resolution, gamma)
       - reciprocal overlap or smaller-contained-in-larger
       - if still overlapping, keep higher scale_support (then size)
+  enrichment gate (default): keep enrichment_fold > 1.5  -> ALL_TRA.tsv
+      - enrichment_fold = max tip×tip O/E near breakpoints
+        (obs/E(d) on tip windows; chromosome raw-contact decay)
+      - enrichment_fold_block = full cand×partner O/E (audit)
+      - enrichment_fold_flank = full cand / flanking-community mean (audit)
+      - pre-gate: ALL_TRA_pre_enrichment.tsv
+      - dropped:  ALL_TRA_enrichment_dropped.tsv
 
 Example:
   python tra_multiscale.py \
@@ -291,6 +298,85 @@ def block_mean_contact(
     return float(np.mean(np.maximum(mat, 0.0)))
 
 
+def build_distance_decay(clr: cooler.Cooler, chrom: str) -> np.ndarray:
+    """Chromosome-wide mean raw contact per bin-distance (includes zeros).
+
+    decay[k] = sum(contacts with |i-j|=k) / n_pairs(k). Used as E(d) for O/E.
+    """
+    mat = clr.matrix(balance=False, sparse=True).fetch(chrom)
+    n = int(mat.shape[0])
+    if n <= 0:
+        return np.zeros(1, dtype=float)
+    coo = mat.tocoo()
+    if coo.nnz == 0:
+        return np.zeros(n, dtype=float)
+    row = coo.row.astype(np.int64, copy=False)
+    col = coo.col.astype(np.int64, copy=False)
+    data = np.maximum(np.asarray(coo.data, dtype=float), 0.0)
+    dist = np.abs(row - col)
+    sums = np.bincount(dist, weights=data, minlength=n).astype(float)
+    upper = int(np.sum(row < col))
+    lower = int(np.sum(row > col))
+    both = upper > 0 and lower > 0
+    ks = np.arange(n, dtype=np.int64)
+    npairs = np.where(ks == 0, n, (n - ks) * (2 if both else 1)).astype(float)
+    decay = sums / np.maximum(npairs, 1.0)
+    # smooth empty far distances with last positive value to avoid 0/0 spikes
+    pos = np.flatnonzero(decay > 0)
+    if pos.size:
+        last = float(decay[pos[-1]])
+        for k in range(int(pos[-1]) + 1, n):
+            decay[k] = last
+    return decay
+
+
+def _bp_to_bin(bp: int, resolution: int, n_bins: int) -> int:
+    return int(min(max(0, int(bp) // int(resolution)), max(0, n_bins - 1)))
+
+
+def expected_rect_mean(
+    decay: np.ndarray,
+    resolution: int,
+    a0: int,
+    a1: int,
+    b0: int,
+    b1: int,
+) -> float:
+    """Mean E(|i-j|) over all bin pairs in rectangle [a0,a1) x [b0,b1)."""
+    n = int(len(decay))
+    if n <= 0:
+        return 0.0
+    res = max(1, int(resolution))
+    i0 = _bp_to_bin(a0, res, n)
+    i1 = _bp_to_bin(max(int(a0) + 1, int(a1)) - 1, res, n) + 1
+    j0 = _bp_to_bin(b0, res, n)
+    j1 = _bp_to_bin(max(int(b0) + 1, int(b1)) - 1, res, n) + 1
+    i1 = min(max(i1, i0 + 1), n)
+    j1 = min(max(j1, j0 + 1), n)
+    na = i1 - i0
+    nb = j1 - j0
+    if na <= 0 or nb <= 0:
+        return 0.0
+    max_d = n - 1
+
+    def _mean_from_rows() -> float:
+        total = 0.0
+        for i in range(i0, i1):
+            d = np.abs(i - np.arange(j0, j1))
+            np.clip(d, 0, max_d, out=d)
+            total += float(decay[d].sum())
+        return total / float(na * nb)
+
+    if na * nb <= 2_000_000:
+        d = np.abs(
+            np.arange(i0, i1, dtype=np.int64)[:, None]
+            - np.arange(j0, j1, dtype=np.int64)[None, :]
+        )
+        np.clip(d, 0, max_d, out=d)
+        return float(decay[d].mean())
+    return _mean_from_rows()
+
+
 def _interval_overlap(a0: int, a1: int, b0: int, b1: int) -> int:
     return max(0, min(a1, b1) - max(a0, b0))
 
@@ -370,6 +456,41 @@ def choose_contact_resolution(
     return pool[-1]
 
 
+def _interval_tips(start: int, end: int, tip_bp: int) -> list[tuple[int, int]]:
+    """Left/right tip windows clipped to [start, end). Short intervals -> one tip."""
+    s, e = int(start), int(end)
+    if e <= s:
+        e = s + 1
+    length = e - s
+    w = max(1, int(tip_bp))
+    if length <= w * 2:
+        # too short to split: use whole interval once
+        return [(s, e)]
+    return [(s, s + w), (e - w, e)]
+
+
+def _oe_fold_for_rect(
+    clr: cooler.Cooler,
+    chrom: str,
+    resolution: int,
+    decay: np.ndarray | None,
+    a0: int,
+    a1: int,
+    b0: int,
+    b1: int,
+) -> tuple[float, float, float]:
+    """Return (fold, cross_mean, expected_mean) for one rectangle."""
+    cross = block_mean_contact(clr, chrom, a0, a1, b0, b1)
+    expected = 0.0
+    if decay is not None and len(decay):
+        expected = expected_rect_mean(decay, resolution, a0, a1, b0, b1)
+    if expected > 0:
+        fold = cross / expected
+    else:
+        fold = float("inf") if cross > 0 else 0.0
+    return float(fold), float(cross), float(expected)
+
+
 def score_event_vs_neighbors(
     clr: cooler.Cooler,
     chrom: str,
@@ -380,11 +501,60 @@ def score_event_vs_neighbors(
     cand_end: int,
     partner_start: int,
     partner_end: int,
+    decay: np.ndarray | None = None,
+    tip_window_bp: int = 2_000_000,
 ) -> dict:
-    """Compare candidatexpartner contact to candidatexflanking communities."""
-    cross = block_mean_contact(
-        clr, chrom, cand_start, cand_end, partner_start, partner_end
+    """Score breakpoint-tip O/E (primary) plus full-block / flank audits.
+
+    Primary enrichment_fold = max O/E over cand-tip × partner-tip windows
+    (default tip 2 Mb, clipped to each interval). Full-block O/E and the old
+    flanking-community ratio are kept for audit only.
+    """
+    # --- full-block O/E (audit) ---
+    fold_block, cross_block, expected_block = _oe_fold_for_rect(
+        clr,
+        chrom,
+        community_resolution,
+        decay,
+        cand_start,
+        cand_end,
+        partner_start,
+        partner_end,
     )
+
+    # --- tip-window O/E (primary) ---
+    tip_bp = max(int(community_resolution), int(tip_window_bp))
+    cand_tips = _interval_tips(cand_start, cand_end, tip_bp)
+    partner_tips = _interval_tips(partner_start, partner_end, tip_bp)
+    best = {
+        "fold": 0.0,
+        "cross": 0.0,
+        "expected": 0.0,
+        "cand_tip": cand_tips[0],
+        "partner_tip": partner_tips[0],
+    }
+    for ca0, ca1 in cand_tips:
+        for pb0, pb1 in partner_tips:
+            fold, cross, expected = _oe_fold_for_rect(
+                clr,
+                chrom,
+                community_resolution,
+                decay,
+                ca0,
+                ca1,
+                pb0,
+                pb1,
+            )
+            if fold > best["fold"]:
+                best = {
+                    "fold": fold,
+                    "cross": cross,
+                    "expected": expected,
+                    "cand_tip": (ca0, ca1),
+                    "partner_tip": (pb0, pb1),
+                }
+
+    # --- flank ratio on full cand (audit; old metric) ---
     neighbors = flanking_neighbor_intervals(
         segments,
         community_resolution,
@@ -399,13 +569,31 @@ def score_event_vs_neighbors(
     ]
     neighbor_mean = float(np.mean(neigh_vals)) if neigh_vals else 0.0
     if neighbor_mean > 0:
-        fold = cross / neighbor_mean
+        fold_flank = cross_block / neighbor_mean
     else:
-        fold = float("inf") if cross > 0 else 0.0
+        fold_flank = float("inf") if cross_block > 0 else 0.0
+
+    mid_c = 0.5 * (int(cand_start) + int(cand_end))
+    mid_p = 0.5 * (int(partner_start) + int(partner_end))
+    dist_bp = abs(mid_c - mid_p)
+    ct0, ct1 = best["cand_tip"]
+    pt0, pt1 = best["partner_tip"]
+
     return {
-        "cross_mean": cross,
+        "cross_mean": float(best["cross"]),
         "neighbor_mean": neighbor_mean,
-        "enrichment_fold": fold,
+        "expected_mean": float(best["expected"]),
+        "enrichment_fold": float(best["fold"]),
+        "enrichment_fold_block": float(fold_block),
+        "enrichment_fold_flank": fold_flank,
+        "cross_mean_block": float(cross_block),
+        "expected_mean_block": float(expected_block),
+        "tip_window_bp": float(tip_bp),
+        "tip_cand_start": float(ct0),
+        "tip_cand_end": float(ct1),
+        "tip_partner_start": float(pt0),
+        "tip_partner_end": float(pt1),
+        "partner_distance_bp": float(dist_bp),
         "n_neighbor_blocks": len(neighbors),
     }
 
@@ -612,6 +800,74 @@ def gain(row: pd.Series) -> float:
     else:
         enrich_term = math.log2(1.0 + max(fold, 1e-6)) * 0.5 - 2.0
     return enrich_term + support + size_term + partner_term
+
+
+def apply_enrichment_gate(
+    merged: pd.DataFrame,
+    min_enrichment_fold: float = 1.5,
+    outdir: Path | None = None,
+) -> pd.DataFrame:
+    """Default final TRA filter: keep enrichment_fold > min_enrichment_fold.
+
+    Writes audit tables when outdir is set. Pass min_enrichment_fold<=0 to
+    disable the gate (returns input unchanged aside from optional pre dump).
+    """
+    if merged is None or len(merged) == 0:
+        return merged if isinstance(merged, pd.DataFrame) else pd.DataFrame()
+
+    out = merged.copy()
+    if outdir is not None:
+        outdir = Path(outdir)
+        outdir.mkdir(parents=True, exist_ok=True)
+        out.to_csv(outdir / "ALL_TRA_pre_enrichment.tsv", sep="\t", index=False)
+
+    min_fold = float(min_enrichment_fold)
+    if min_fold <= 0:
+        print(
+            "[INFO] enrichment gate disabled (min-enrichment-fold<=0)",
+            flush=True,
+        )
+        return out
+
+    if "enrichment_fold" not in out.columns:
+        print(
+            "[WARN] enrichment gate requested but enrichment_fold missing; "
+            "keeping all merged calls",
+            flush=True,
+        )
+        return out
+
+    folds = pd.to_numeric(out["enrichment_fold"], errors="coerce").fillna(0.0)
+    keep = folds > min_fold
+    dropped = out.loc[~keep].copy()
+    kept = out.loc[keep].reset_index(drop=True)
+    if len(kept):
+        kept = kept.copy()
+        kept["cluster_id"] = np.arange(1, len(kept) + 1, dtype=int)
+
+    print(
+        f"[INFO] enrichment gate O/E fold>{min_fold:g}: "
+        f"{len(out)} -> {len(kept)} kept "
+        f"({int((~keep).sum())} dropped)",
+        flush=True,
+    )
+    if outdir is not None and len(dropped):
+        dropped.to_csv(
+            outdir / "ALL_TRA_enrichment_dropped.tsv", sep="\t", index=False
+        )
+        for _, r in dropped.iterrows():
+            flank = r.get("enrichment_fold_flank", float("nan"))
+            try:
+                flank_s = f"{float(flank):.3g}"
+            except (TypeError, ValueError):
+                flank_s = "NA"
+            print(
+                f"  DROP {r.get('chrom', '?')}:{int(r['start'])}-{int(r['end'])} "
+                f"oe_fold={float(r['enrichment_fold']):.3g} "
+                f"flank_fold={flank_s}",
+                flush=True,
+            )
+    return kept
 
 
 def build_conflicts(df: pd.DataFrame, min_overlap_frac: float = 0.3) -> list[tuple[int, int]]:
@@ -1242,18 +1498,18 @@ def annotate_mutual_insert_on_merged(
     Adds columns:
       mutual_insert      1 if call is one side of a mutual-insert pair
       mutual_pair_id     shared id for the two sides (0 = not mutual)
-      mutual_eval_keep   1 = keep for eval; 0 = drop the duplicate side
-                         (prefer higher enrichment_fold, then larger size)
       mutual_partner_start / mutual_partner_end  the other side's interval
-    Both sides stay in ALL_TRA; eval should drop rows with mutual_eval_keep==0.
+
+    Both sides stay in ALL_TRA with equal status (no primary/secondary drop).
     """
     out = merged.copy()
     n = len(out)
     out["mutual_insert"] = 0
     out["mutual_pair_id"] = 0
-    out["mutual_eval_keep"] = 1
     out["mutual_partner_start"] = -1
     out["mutual_partner_end"] = -1
+    if "mutual_eval_keep" in out.columns:
+        out = out.drop(columns=["mutual_eval_keep"])
     if n == 0 or not mutual_records:
         return out
 
@@ -1269,7 +1525,6 @@ def annotate_mutual_insert_on_merged(
 
     # unique unordered pairs of call indices
     pair_set: set[tuple[int, int]] = set()
-    pair_coords: dict[tuple[int, int], tuple[int, int, int, int]] = {}
     for rec in mutual_records:
         chrom = str(rec["chrom"])
         ia = _hit(int(rec["start"]), int(rec["end"]), chrom)
@@ -1278,35 +1533,16 @@ def annotate_mutual_insert_on_merged(
             continue
         key = (ia, ib) if ia < ib else (ib, ia)
         pair_set.add(key)
-        pair_coords[key] = (
-            int(out.at[key[0], "start"]),
-            int(out.at[key[0], "end"]),
-            int(out.at[key[1], "start"]),
-            int(out.at[key[1], "end"]),
-        )
 
     for pid, (ia, ib) in enumerate(sorted(pair_set), start=1):
         sa, ea = int(out.at[ia, "start"]), int(out.at[ia, "end"])
         sb, eb = int(out.at[ib, "start"]), int(out.at[ib, "end"])
-        # Prefer larger arm (usually the donor), then enrichment / support.
-        score_a = (
-            ea - sa,
-            float(out.at[ia, "enrichment_fold"]),
-            int(out.at[ia, "scale_support"]) if "scale_support" in out.columns else 0,
-        )
-        score_b = (
-            eb - sb,
-            float(out.at[ib, "enrichment_fold"]),
-            int(out.at[ib, "scale_support"]) if "scale_support" in out.columns else 0,
-        )
-        keep_a = score_a >= score_b
-        for i, other_s, other_e, keep in (
-            (ia, sb, eb, keep_a),
-            (ib, sa, ea, not keep_a),
+        for i, other_s, other_e in (
+            (ia, sb, eb),
+            (ib, sa, ea),
         ):
             out.at[i, "mutual_insert"] = 1
             out.at[i, "mutual_pair_id"] = pid
-            out.at[i, "mutual_eval_keep"] = 1 if keep else 0
             out.at[i, "mutual_partner_start"] = other_s
             out.at[i, "mutual_partner_end"] = other_e
     return out
@@ -1543,35 +1779,49 @@ def score_enrichment_for_calls(
     chrom_size: int,
     resolution: int,
     segments: pd.DataFrame,
+    tip_window_bp: int = 2_000_000,
 ) -> pd.DataFrame:
-    """Fill enrichment_fold using candidatexpartner vs flanking communities."""
+    """Fill tip-window O/E enrichment_fold; keep block/flank folds for audit."""
     clr = cooler.Cooler(f"{mcool}::/resolutions/{resolution}")
-    folds = []
-    crosses = []
-    neighs = []
+    decay = build_distance_decay(clr, chrom)
+    rows_metrics = []
     for _, row in calls.iterrows():
-        metrics = score_event_vs_neighbors(
-            clr,
-            chrom,
-            chrom_size,
-            segments,
-            resolution,
-            int(row["start"]),
-            int(row["end"]),
-            int(row["partner_start"]),
-            int(row["partner_end"]),
+        rows_metrics.append(
+            score_event_vs_neighbors(
+                clr,
+                chrom,
+                chrom_size,
+                segments,
+                resolution,
+                int(row["start"]),
+                int(row["end"]),
+                int(row["partner_start"]),
+                int(row["partner_end"]),
+                decay=decay,
+                tip_window_bp=tip_window_bp,
+            )
         )
-        folds.append(float(metrics["enrichment_fold"]))
-        crosses.append(float(metrics["cross_mean"]))
-        neighs.append(float(metrics["neighbor_mean"]))
     out = calls.copy()
-    out["enrichment_fold"] = folds
-    out["cross_mean"] = crosses
-    out["neighbor_mean"] = neighs
-    # guard inf
-    out["enrichment_fold"] = out["enrichment_fold"].replace(
-        [np.inf, -np.inf], np.nan
-    ).fillna(0.0)
+    keys = [
+        "enrichment_fold",
+        "enrichment_fold_block",
+        "enrichment_fold_flank",
+        "cross_mean",
+        "cross_mean_block",
+        "neighbor_mean",
+        "expected_mean",
+        "expected_mean_block",
+        "partner_distance_bp",
+        "tip_window_bp",
+        "tip_cand_start",
+        "tip_cand_end",
+        "tip_partner_start",
+        "tip_partner_end",
+    ]
+    for key in keys:
+        out[key] = [float(m[key]) for m in rows_metrics]
+    for col in ("enrichment_fold", "enrichment_fold_block", "enrichment_fold_flank"):
+        out[col] = out[col].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     return out
 
 
@@ -1627,6 +1877,28 @@ def merge_true_across_resolutions(
                     "partner_start": int(r["partner_start"]),
                     "partner_end": int(r["partner_end"]),
                     "enrichment_fold": float(r["enrichment_fold"]),
+                    "enrichment_fold_block": float(
+                        r["enrichment_fold_block"]
+                        if "enrichment_fold_block" in r.index
+                        and pd.notna(r.get("enrichment_fold_block"))
+                        else r["enrichment_fold"]
+                    ),
+                    "enrichment_fold_flank": float(
+                        r["enrichment_fold_flank"]
+                        if "enrichment_fold_flank" in r.index
+                        and pd.notna(r.get("enrichment_fold_flank"))
+                        else r["enrichment_fold"]
+                    ),
+                    "partner_distance_bp": float(
+                        r["partner_distance_bp"]
+                        if "partner_distance_bp" in r.index
+                        and pd.notna(r.get("partner_distance_bp"))
+                        else abs(
+                            0.5 * (int(r["start"]) + int(r["end"]))
+                            - 0.5
+                            * (int(r["partner_start"]) + int(r["partner_end"]))
+                        )
+                    ),
                     "gain": float(r.get("gain", 0.0) or 0.0),
                     "round": int(r.get("round", 0) or 0),
                 }
@@ -1695,6 +1967,9 @@ def merge_true_across_resolutions(
                 "partner_start": int(rep["partner_start"]),
                 "partner_end": int(rep["partner_end"]),
                 "enrichment_fold": float(sub["enrichment_fold"].max()),
+                "enrichment_fold_block": float(sub["enrichment_fold_block"].max()),
+                "enrichment_fold_flank": float(sub["enrichment_fold_flank"].max()),
+                "partner_distance_bp": float(sub["partner_distance_bp"].median()),
                 "scale_support": len(scale_keys),
                 "resolutions": ",".join(str(r) for r in res_list),
                 "gammas": ",".join(f"{g:g}" for g in gammas),
@@ -2028,6 +2303,24 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--bridge-bp", type=int, default=500_000)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--min-true-fold", type=float, default=1.0)
+    ap.add_argument(
+        "--min-enrichment-fold",
+        type=float,
+        default=1.5,
+        help=(
+            "final TRA gate after clear-insert merge: keep only calls with "
+            "enrichment_fold > this value (default: 1.5). Set <=0 to disable."
+        ),
+    )
+    ap.add_argument(
+        "--tip-window-bp",
+        type=int,
+        default=2_000_000,
+        help=(
+            "breakpoint tip window for primary O/E enrichment_fold "
+            "(default: 2000000; clipped to each interval)"
+        ),
+    )
     ap.add_argument("--merge-min-rec", type=float, default=0.5)
     ap.add_argument(
         "--from-tsv",
@@ -2074,6 +2367,7 @@ def _run_one_res_gamma(payload: dict) -> dict:
     bridge_bp = int(payload["bridge_bp"])
     min_true_fold = float(payload["min_true_fold"])
     skip_enrichment = bool(payload["skip_enrichment"])
+    tip_window_bp = int(payload.get("tip_window_bp", 2_000_000))
     from_tsv = bool(payload["from_tsv"])
     truth_path = payload.get("truth_path")
 
@@ -2131,12 +2425,20 @@ def _run_one_res_gamma(payload: dict) -> dict:
 
     if not skip_enrichment:
         calls = score_enrichment_for_calls(
-            calls, mcool, chrom, chrom_size, res, segments
+            calls,
+            mcool,
+            chrom,
+            chrom_size,
+            res,
+            segments,
+            tip_window_bp=tip_window_bp,
         )
         log(
-            f"[INFO] enrichment fold median="
+            f"[INFO] tip O/E fold median="
             f"{calls['enrichment_fold'].median():.3f} "
-            f"max={calls['enrichment_fold'].max():.3f}"
+            f"max={calls['enrichment_fold'].max():.3f} "
+            f"(block median={calls['enrichment_fold_block'].median():.3f}, "
+            f"tip_bp={tip_window_bp})"
         )
 
     tag = f"r{res}_g{gamma:g}"
@@ -2317,6 +2619,7 @@ def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
                     "bridge_bp": int(args.bridge_bp),
                     "min_true_fold": float(args.min_true_fold),
                     "skip_enrichment": bool(args.skip_enrichment),
+                    "tip_window_bp": int(args.tip_window_bp),
                     "from_tsv": bool(args.from_tsv),
                     "per_scale": str(args.per_scale) if args.from_tsv else "",
                     "truth_path": str(args.truth) if args.truth is not None else None,
@@ -2399,11 +2702,11 @@ def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
             merged, all_mutual_records, min_rec=args.merge_min_rec
         )
         n_mutual = int((merged["mutual_insert"] == 1).sum()) if "mutual_insert" in merged.columns else 0
-        n_drop = int((merged["mutual_eval_keep"] == 0).sum()) if "mutual_eval_keep" in merged.columns else 0
+        n_pairs = int(merged["mutual_pair_id"].nunique()) if n_mutual and "mutual_pair_id" in merged.columns else 0
         if n_mutual:
             print(
                 f"[INFO] mutual-insert marked: {n_mutual} calls "
-                f"({n_drop} secondary for eval drop)",
+                f"({n_pairs} pairs; both sides kept)",
                 flush=True,
             )
     merged_path = args.outdir / "merged_true_calls.tsv"
@@ -2411,6 +2714,12 @@ def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
         if "size" not in merged.columns and {"start", "end"} <= set(merged.columns):
             merged = merged.copy()
             merged["size"] = merged["end"].astype(int) - merged["start"].astype(int)
+        # Default final step: enrichment_fold gate -> ALL_TRA.tsv
+        merged = apply_enrichment_gate(
+            merged,
+            min_enrichment_fold=float(getattr(args, "min_enrichment_fold", 1.5)),
+            outdir=args.outdir,
+        )
         merged.to_csv(merged_path, sep="\t", index=False)
         # PHASC-style alias for pipeline / downstream tools
         merged.to_csv(args.outdir / "ALL_TRA.tsv", sep="\t", index=False)
@@ -2498,13 +2807,17 @@ def main(argv: list[str] | None = None) -> pd.DataFrame:
     args = build_parser().parse_args(argv)
     print(
         "[INFO] tra_multiscale\n"
-        f"  mcool          = {args.mcool}\n"
-        f"  chrom          = {args.chrom}\n"
-        f"  resolutions    = {args.resolutions}\n"
-        f"  gammas         = {args.gammas}\n"
-        f"  edge_quantile  = {args.edge_quantile}  "
+        f"  mcool                 = {args.mcool}\n"
+        f"  chrom                 = {args.chrom}\n"
+        f"  resolutions           = {args.resolutions}\n"
+        f"  gammas                = {args.gammas}\n"
+        f"  edge_quantile         = {args.edge_quantile}  "
         f"(top {(1 - float(args.edge_quantile)) * 100:.0f}%)\n"
-        f"  outdir         = {args.outdir}",
+        f"  min-enrichment-fold   = {args.min_enrichment_fold}  "
+        f"(final ALL_TRA gate; <=0 disables)\n"
+        f"  tip-window-bp         = {args.tip_window_bp}  "
+        f"(breakpoint tip O/E)\n"
+        f"  outdir                = {args.outdir}",
         flush=True,
     )
     return run_pipeline(args)

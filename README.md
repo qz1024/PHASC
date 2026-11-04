@@ -136,7 +136,9 @@ Optional refinement:
 
 ### `translocation`
 
-Detects intra-chromosomal translocation candidates across multiple Hi-C resolutions × Louvain gammas, then merges overlapping calls into consensus events.
+Detects intra-chromosomal translocation candidates across multiple Hi-C resolutions × Louvain gammas, then merges overlapping calls.
+
+**Default flow:** cluster → score enrichment → clear-insert ILP → merge scales → **enrichment gate (`fold > 1.5`)** → `ALL_TRA.tsv`.
 
 ```bash
 ./phasc translocation \
@@ -152,8 +154,15 @@ Useful options:
 - `--resolutions 50000,100000,200000,500000` — Hi-C resolutions
 - `--gammas 0.5,0.75,1.0,1.25,1.5,2.0` — Louvain/PLM gammas
 - `--jobs 4` — parallel (resolution × gamma) workers
+- `--min-enrichment-fold 1.5` — final gate after merge (`enrichment_fold >` threshold; **default 1.5**; `<=0` disables). `enrichment_fold` is **breakpoint tip-window** distance-corrected O/E (max over cand-tip×partner-tip); `--tip-window-bp` default 2 Mb. `enrichment_fold_block` / `enrichment_fold_flank` keep full-block O/E and old flank ratio for audit.
 - `--truth truth.bed` — optional evaluation against known TRA intervals
 - `--skip-plot` — skip community figure rendering
+
+Outputs:
+
+- `ALL_TRA.tsv` — final calls **after** enrichment gate
+- `ALL_TRA_pre_enrichment.tsv` — merged calls before the gate
+- `ALL_TRA_enrichment_dropped.tsv` — rows removed by the gate
 
 
 ### `pipeline`
@@ -171,6 +180,7 @@ Useful options:
 
 - `--chromosomes chr3B` — chromosome passed to translocation (first name only)
 - `--inv-min-support 2` — inversion multiscale support threshold
+- `--min-enrichment-fold 1.5` — forwarded to translocation final gate (default 1.5)
 - `--truth truth.bed` — optional TRA truth BED for evaluation prints
 - `--tra-skip-plot` / `--no-tra-skip-plot` — control TRA community plots
 - `--keep-work` — retain `outdir/.pipeline_work` for debugging
@@ -178,7 +188,7 @@ Useful options:
 Main outputs:
 
 - `ALL_INV_multiscale.tsv` — inversion calls
-- `ALL_TRA.tsv` / `merged_true_calls.tsv` — translocation calls
+- `ALL_TRA.tsv` / `merged_true_calls.tsv` — translocation calls (enrichment-gated)
 - `ALL_SV.tsv` — combined INV + TRA table
 - `HiC_images/` — inversion Hi-C panels
 
