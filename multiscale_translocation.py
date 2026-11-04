@@ -51,6 +51,37 @@ from matplotlib.colors import LogNorm
 # Community clustering
 # =============================================================================
 
+# Final TRA table schema (always written, even when empty — header-only TSV).
+ALL_TRA_COLUMNS = [
+    "cluster_id",
+    "chrom",
+    "start",
+    "end",
+    "partner_start",
+    "partner_end",
+    "enrichment_fold",
+    "enrichment_fold_block",
+    "enrichment_fold_flank",
+    "partner_distance_bp",
+    "scale_support",
+    "resolutions",
+    "gammas",
+    "member_resolutions",
+    "n_members",
+    "start_min",
+    "end_max",
+    "mutual_insert",
+    "mutual_pair_id",
+    "mutual_partner_start",
+    "mutual_partner_end",
+    "size",
+]
+
+
+def empty_tra_table() -> pd.DataFrame:
+    return pd.DataFrame(columns=ALL_TRA_COLUMNS)
+
+
 CANDIDATE_COLUMNS = [
     "scale_id",
     "resolution",
@@ -811,15 +842,21 @@ def apply_enrichment_gate(
 
     Writes audit tables when outdir is set. Pass min_enrichment_fold<=0 to
     disable the gate (returns input unchanged aside from optional pre dump).
+    Empty input still writes header-only pre/dropped/ALL audit tables.
     """
-    if merged is None or len(merged) == 0:
-        return merged if isinstance(merged, pd.DataFrame) else pd.DataFrame()
-
+    if merged is None or not isinstance(merged, pd.DataFrame):
+        merged = empty_tra_table()
     out = merged.copy()
     if outdir is not None:
         outdir = Path(outdir)
         outdir.mkdir(parents=True, exist_ok=True)
         out.to_csv(outdir / "ALL_TRA_pre_enrichment.tsv", sep="\t", index=False)
+    if len(out) == 0:
+        if outdir is not None:
+            empty_tra_table().to_csv(
+                outdir / "ALL_TRA_enrichment_dropped.tsv", sep="\t", index=False
+            )
+        return empty_tra_table() if out.empty else out
 
     min_fold = float(min_enrichment_fold)
     if min_fold <= 0:
@@ -2710,6 +2747,8 @@ def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
                 flush=True,
             )
     merged_path = args.outdir / "merged_true_calls.tsv"
+    tra_path = args.outdir / "ALL_TRA.tsv"
+    pre_path = args.outdir / "ALL_TRA_pre_enrichment.tsv"
     if len(merged):
         if "size" not in merged.columns and {"start", "end"} <= set(merged.columns):
             merged = merged.copy()
@@ -2720,14 +2759,24 @@ def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
             min_enrichment_fold=float(getattr(args, "min_enrichment_fold", 1.5)),
             outdir=args.outdir,
         )
-        merged.to_csv(merged_path, sep="\t", index=False)
-        # PHASC-style alias for pipeline / downstream tools
-        merged.to_csv(args.outdir / "ALL_TRA.tsv", sep="\t", index=False)
     else:
-        pd.DataFrame().to_csv(merged_path, sep="\t", index=False)
-        pd.DataFrame().to_csv(args.outdir / "ALL_TRA.tsv", sep="\t", index=False)
+        merged = empty_tra_table()
+        # Keep audit tables well-formed for downstream merge / empty chroms.
+        merged.to_csv(pre_path, sep="\t", index=False)
+        empty_tra_table().to_csv(
+            args.outdir / "ALL_TRA_enrichment_dropped.tsv", sep="\t", index=False
+        )
+    # Align to stable column order when present; keep any extras at the end.
+    ordered = [c for c in ALL_TRA_COLUMNS if c in merged.columns]
+    extra = [c for c in merged.columns if c not in ordered]
+    if ordered or extra:
+        merged = merged.loc[:, ordered + extra]
+    merged.to_csv(merged_path, sep="\t", index=False)
+    merged.to_csv(tra_path, sep="\t", index=False)
+    if not pre_path.exists():
+        merged.to_csv(pre_path, sep="\t", index=False)
     print(f"\n[INFO] merged true calls: {len(merged)} -> {merged_path}", flush=True)
-    print(f"[INFO] ALL_TRA.tsv -> {args.outdir / 'ALL_TRA.tsv'}", flush=True)
+    print(f"[INFO] ALL_TRA.tsv -> {tra_path}", flush=True)
 
     if len(merged) and args.truth is not None:
         mev = evaluate_against_truth(merged, truth)
@@ -2825,3 +2874,4 @@ def main(argv: list[str] | None = None) -> pd.DataFrame:
 
 if __name__ == "__main__":
     main()
+    raise SystemExit(0)
