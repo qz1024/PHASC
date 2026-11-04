@@ -215,28 +215,6 @@ def parse_args():
 
 
     parser.add_argument(
-        "--min_neighbor_blocks",
-        type=int,
-        default=2,
-        help=(
-            "deprecated: ignored by detection; kept for CLI compatibility "
-            "(default: 2)"
-        )
-    )
-
-
-    parser.add_argument(
-        "--max_neighbor_blocks",
-        type=int,
-        default=8,
-        help=(
-            "deprecated: ignored by detection; kept for CLI compatibility "
-            "(default: 8)"
-        )
-    )
-
-
-    parser.add_argument(
         "--neighbor_scale_fractions",
         type=float,
         nargs="+",
@@ -340,17 +318,6 @@ def parse_args():
 
 
     parser.add_argument(
-        "--offdiag_fill_max",
-        type=float,
-        default=0.25,
-        help=(
-            "max allowed mean(|i-j|>=3)/mean(1<=|i-j|<=2) inside S; rejects "
-            "blocky/grid repeat clouds (default: 0.25; <=0 disables)"
-        )
-    )
-
-
-    parser.add_argument(
         "--s_qc_resolution",
         type=int,
         default=50_000,
@@ -386,24 +353,11 @@ def parse_args():
     parser.add_argument(
         "--gcor_low_signal_frac",
         type=float,
-        default=0.3,
+        default=0.0,
         help=(
             "before GCOR Spearman, drop flank×S rows/cols whose mean is < "
             "this × median(positive axis means); kills hole/dead-strip bias "
-            "(default: 0.3; <=0 disables)"
-        )
-    )
-
-
-    parser.add_argument(
-        "--s_anti_diag_min",
-        type=float,
-        default=2.0,
-        help=(
-            "min S×S anti-diagonal/background ratio required for internal "
-            "(two-sided) INV calls; kills flank-GCOR FPs with no bowtie in S "
-            "(default: 2.0; <=0 disables). Tip oneside is exempt (uses "
-            "--tip_anti_diag_* rescue instead)."
+            "(default: 0.0; <=0 disables)"
         )
     )
 
@@ -411,13 +365,69 @@ def parse_args():
     parser.add_argument(
         "--flip_improve_min",
         type=float,
-        default=0.2,
+        default=0.0,
         help=(
             "min (continuity_after_flip - continuity_before) to accept an INV. "
             "Flip S in the contact matrix; continuity = Spearman(contact, "
             "-dist_to_junction) on L×S / S×R. Positive delta ⇒ flip made "
             "junctions more continuous ⇒ assembly had S inverted. "
-            "Default 0.2; set < -1e8 to disable."
+            "Default 0.0; set < -1e8 to disable."
+        )
+    )
+
+
+    parser.add_argument(
+        "--gcor_strong_arm_min",
+        type=float,
+        default=0.5,
+        help=(
+            "require max(|ρL|, |ρR|) >= this to accept an INV "
+            "(at least one flank must be this strong; default: 0.5; <=0 off)"
+        )
+    )
+
+
+    parser.add_argument(
+        "--small_inv_max_size",
+        type=int,
+        default=1_000_000,
+        help=(
+            "calls with |S| <= this use stricter small-call gates "
+            "(default: 1000000; <=0 disables size-dependent tightening)"
+        )
+    )
+
+
+    parser.add_argument(
+        "--small_rho_cutoff",
+        type=float,
+        default=0.5,
+        help=(
+            "GCOR |Spearman ρ| cutoff when |S| <= --small_inv_max_size "
+            "(default: 0.5; tighter than --rho_cutoff). Applied before "
+            "large-block relaxation so tiny FPs are not loosened."
+        )
+    )
+
+
+    parser.add_argument(
+        "--small_s_anti_diag_min",
+        type=float,
+        default=2.0,
+        help=(
+            "min S×S anti/bg for internal INV when |S| <= --small_inv_max_size "
+            "(default: 2.0; <=0 off). Tip oneside is exempt."
+        )
+    )
+
+
+    parser.add_argument(
+        "--small_flip_improve_min",
+        type=float,
+        default=0.2,
+        help=(
+            "min flip continuity delta when |S| <= --small_inv_max_size "
+            "(default: 0.2; overrides --flip_improve_min for small calls)"
         )
     )
 
@@ -447,10 +457,11 @@ def parse_args():
     parser.add_argument(
         "--tip_anti_diag_rescue",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
             "grow chrom-tip Louvain tiles by S×S anti/background ratio to "
-            "rescue Juicebox tip bowties that flank-GCOR misses (default: on)"
+            "rescue Juicebox tip bowties that flank-GCOR misses "
+            "(default: off)"
         )
     )
 
@@ -523,17 +534,6 @@ def parse_args():
         help=(
             "if only one flank passes GCOR and S gap fraction >= this, mask "
             "GAP bins and re-test the failing flank (default: 0.10; <=0 disables)"
-        )
-    )
-
-
-    parser.add_argument(
-        "--gap_oneside_corner_min",
-        type=float,
-        default=1.20,
-        help=(
-            "unused (kept for CLI compatibility); gap rescue no longer grants "
-            "oneside INV without the other flank recovering"
         )
     )
 
@@ -750,28 +750,10 @@ def parse_args():
     args=parser.parse_args()
 
 
-    if args.min_neighbor_blocks<2:
-
-        parser.error(
-            "--min_neighbor_blocks must be >= 2"
-        )
-
-
     if args.min_block<=0:
 
         parser.error(
             "--min_block must be > 0"
-        )
-
-
-    if (
-        args.max_neighbor_blocks
-        <
-        args.min_neighbor_blocks
-    ):
-
-        parser.error(
-            "--max_neighbor_blocks must be >= --min_neighbor_blocks"
         )
 
 
@@ -1713,12 +1695,14 @@ def _edge_oneside_guard_selfcheck():
         corner_diag_bg_min=0.0
         lattice_peak_max=0
         parallel_diag_max=0
-        offdiag_fill_max=0
         min_s_occupancy=0
         max_s_gap_frac=-1
         oneside_min_size=0
         gap_oneside_min_frac=0
         gap_mask=None
+        flip_improve_min=0.0
+        gcor_low_signal_frac=0.0
+        gcor_strong_arm_min=0.0
     args=_A()
     blocks=[[0, 500_000, 0], [500_000, 1_000_000, 1], [1_000_000, 1_500_000, 2]]
     hic=np.eye(30, dtype=float)
@@ -2557,8 +2541,9 @@ def parallel_stripe_mapped_inbox_frac(
     Only offsets k >= |call|/2 are scored — those cannot fit inside S, so
     S-internal parallel_diag misses them (INV13: k≈1.4 Mb on a 1.2 Mb box).
 
-    Skip k ≈ |call| (lights both INV breakpoints / bowtie, not a stripe)
-    and k beyond max_k_frac of the window.
+    k ≈ |call| is also scored (no bowtie exemption): segmental-duplication
+    parallel copies at spacing ≈ |S| (e.g. INV50) must be filterable via
+    mapped_inbox_min. Offsets beyond max_k_frac of the window are ignored.
 
     For each such k: mark call bins that are an endpoint of an ON cell on
     +k / -k; mapped length = first→last hit span / |call|. Return
@@ -2582,14 +2567,9 @@ def parallel_stripe_mapped_inbox_frac(
     # misses a short in-box stripe that also leaks outside — s_len covers that)
     k_lo = max(int(near_diag) + 1, n_call // 2)
     k_hi = min(n - 1, max(k_lo + 1, int(np.floor(float(max_k_frac) * n))))
-    # skip k ≈ |S|: constant-offset link between the two INV ends
-    k_bow_lo = int(np.floor(0.75 * n_call))
-    k_bow_hi = int(np.ceil(1.25 * n_call))
     best = 0.0
     best_k = None
     for k in range(k_lo, k_hi):
-        if k_bow_lo <= k <= k_bow_hi:
-            continue
         scores = []
         for sign in (1, -1):
             d = np.asarray(np.diag(W, sign * k), dtype=float)
@@ -2651,12 +2631,18 @@ def _parallel_diag_selfcheck():
         W, w0=0, start=30, end=42, res=1, thr_frac=0.15
     )
     assert mk == 20 and mapped >= 0.5, (mapped, mk)
-    # k ≈ |call| bowtie link must not count as mapped parallel stripe
+    # k ≈ |call| duplication stripe MUST count (no bowtie exemption).
+    # Window n=80 → max_k_frac=0.45 limits k<36; use |S|=40 call with k=30
+    # (was inside the old 0.75–1.25 |S| skip band).
     bow = np.eye(80) * 10.0
-    mapped_b, _ = parallel_stripe_mapped_inbox_frac(
+    for i in range(10, 50):
+        if i + 30 < 80:
+            bow[i, i + 30] = 9.0
+            bow[i + 30, i] = 9.0
+    mapped_b, mk_b = parallel_stripe_mapped_inbox_frac(
         bow, w0=0, start=20, end=60, res=1, thr_frac=0.15
     )
-    assert mapped_b < 0.5, mapped_b
+    assert mk_b == 30 and mapped_b >= 0.5, (mapped_b, mk_b)
 
 
 def filter_parallel_stripe_calls(
@@ -2664,7 +2650,6 @@ def filter_parallel_stripe_calls(
     calls,
     resolution=50_000,
     parallel_diag_max=0.30,
-    parallel_mass_frac_max=0.0,
     context_flank_factor=3.0,
     thr_frac=0.15,
     mapped_inbox_min=0.5,
@@ -2679,7 +2664,6 @@ def filter_parallel_stripe_calls(
       2) else project the stripe onto the call: mapped length / |call|
          >= mapped_inbox_min (default 0.5) also drops — catches offsets
          wider than S that S-internal QC cannot see (INV13).
-    parallel_mass_frac_max kept for CLI compat; ignored (<=0).
     """
     if calls is None or calls.empty:
         return calls
@@ -3138,11 +3122,21 @@ def gcor_oneside_accept(
 
 def effective_rho_cutoff(args, target_size):
     """
-    |ρ| cutoff for GCOR votes. Large Louvain communities often show a
-    diluted orientation trend (e.g. 500 kb tip 0-24.5 Mb: ρ≈-0.27 vs
-    default 0.30); use a relaxed cutoff when |S| is big enough.
+    |ρ| cutoff for GCOR votes.
+
+    Small calls (|S| <= small_inv_max_size) use a tighter cutoff first —
+    short blocks easily get noisy high/low ρ, and must not inherit the
+    large-block relaxation (especially when large_block_min_size is tiny).
+
+    Large Louvain communities often show a diluted orientation trend
+    (e.g. 500 kb tip 0-24.5 Mb: ρ≈-0.27 vs default 0.30); use a relaxed
+    cutoff when |S| is big enough.
     """
     base=float(getattr(args, "rho_cutoff", 0.3))
+    small_max=int(getattr(args, "small_inv_max_size", 1_000_000))
+    if small_max>0 and int(target_size)<=small_max:
+        tight=float(getattr(args, "small_rho_cutoff", 0.5))
+        return max(base, max(0.0, tight))
     min_size=int(getattr(args, "large_block_min_size", 15_000_000))
     if min_size<=0 or int(target_size)<min_size:
         return base
@@ -3555,11 +3549,10 @@ def detect_block_INV(
     if parallel_max>0 and np.isfinite(parallel_diag):
         parallel_pass=int(parallel_diag<=parallel_max)
 
-    fill_max=float(getattr(args, "offdiag_fill_max", 0.0))
+    # offdiag-fill gate removed from CLI; always off
+    fill_max=0.0
     offdiag_fill=s_matrix_offdiag_fill_ratio(s_mat)
     fill_pass=1
-    if fill_max>0 and np.isfinite(offdiag_fill):
-        fill_pass=int(offdiag_fill<=fill_max)
 
     occ_min=float(getattr(args, "min_s_occupancy", 0.60))
     gap_max=float(getattr(args, "max_s_gap_frac", 0.25))
@@ -3607,15 +3600,20 @@ def detect_block_INV(
     if gap_max>=0 and np.isfinite(s_gap_frac):
         signal_pass=int(signal_pass and s_gap_frac<=gap_max)
 
-    # Internal INV must show a bowtie inside S, not only flank GCOR orientation.
-    # Tip oneside is exempt: sparse tips use --tip_anti_diag_rescue instead.
-    anti_min=float(getattr(args, "s_anti_diag_min", 0.0))
+    # Size-dependent tightening for short calls.
+    small_max=int(getattr(args, "small_inv_max_size", 1_000_000))
+    is_small=small_max>0 and int(target_size)<=small_max
+    # Global anti-diag gate removed; keep it for small *internal* calls
+    # (INV208-like: noisy flank GCOR, no bowtie). Tip oneside exempt.
+    anti_min=0.0
+    if is_small and edge_oneside is None:
+        anti_min=float(getattr(args, "small_s_anti_diag_min", 2.0))
     band=int(getattr(args, "corner_band_bins", 2))
     s_anti_ratio,s_anti_mean,s_diag_mean=s_matrix_anti_diag_bg_ratio(
         s_signal, band=band
     )
     anti_pass=1
-    if edge_oneside is None and anti_min>0:
+    if anti_min>0:
         if not np.isfinite(s_anti_ratio) or float(s_anti_ratio)<anti_min:
             anti_pass=0
 
@@ -3745,17 +3743,34 @@ def detect_block_INV(
     ):
         corner_pass=1
 
+    # At least one flank |ρ| must reach gcor_strong_arm_min (default 0.5).
+    strong_arm_min=float(getattr(args, "gcor_strong_arm_min", 0.5))
+    if strong_arm_min<=0:
+        strong_arm_pass=1
+    else:
+        strong_arm_pass=int(
+            max(abs(float(mean_left)), abs(float(mean_right)))
+            >= strong_arm_min
+        )
+
     # Flip-S only if every cheaper gate already passes. Local window only
     # (see flip_improvement_score) — never copy the whole chrom matrix.
+    # Small internal calls use a stricter flip floor (noise GCOR FPs).
+    # Default flip_improve_min=0 ⇒ require flipΔ >= 0.
     flip_min=float(getattr(args, "flip_improve_min", 0.0))
+    if is_small:
+        flip_min=max(
+            flip_min,
+            float(getattr(args, "small_flip_improve_min", 0.2)),
+        )
     flip_delta=float("nan")
     flip_before=float("nan")
     flip_after=float("nan")
     flip_pass=1
     other_ok=int(
-        gcor_inv==1 and corner_pass==1 and lattice_pass==1
-        and parallel_pass==1 and fill_pass==1 and signal_pass==1
-        and anti_pass==1
+        gcor_inv==1 and strong_arm_pass==1 and corner_pass==1
+        and lattice_pass==1 and parallel_pass==1 and fill_pass==1
+        and signal_pass==1 and anti_pass==1
     )
     if flip_min > -1e8 and other_ok==1:
         left_span=(
@@ -3796,6 +3811,8 @@ def detect_block_INV(
         "left_vote":left_vote_final,
         "right_vote":right_vote_final,
         "rho_cutoff_used":rho_cut,
+        "strong_arm_min":strong_arm_min,
+        "strong_arm_pass":strong_arm_pass,
         "INV":inv,
         "gcor_inv":gcor_inv,
         "corner_enrichment":corner_score if np.isfinite(corner_score) else "NA",
@@ -3956,7 +3973,10 @@ def _tip_anti_diag_grow_rescue(
         True chromosome length. Required when `hic` is a sub-window (diagnose);
         otherwise window ends are mistaken for chrom 3' tips.
     """
-    if not bool(getattr(args, "tip_anti_diag_rescue", True)):
+    if not bool(getattr(args, "tip_anti_diag_rescue", False)):
+        return
+    # Tip anti-diag writes ρL=ρR=0; incompatible with strong-arm GCOR gate.
+    if float(getattr(args, "gcor_strong_arm_min", 0.5)) > 0:
         return
     if len(blocks) < 2:
         return
@@ -4165,16 +4185,19 @@ def diagnose_region(mcool_file, region, res=50_000, balance=False, outdir="diagn
         corner_diag_bg_min=0.0,
         lattice_peak_max=0.30,
         parallel_diag_max=0.30,
-        offdiag_fill_max=0.0,
         min_s_occupancy=0.60,
         max_s_gap_frac=0.25,
-        s_anti_diag_min=0.0,
         flip_improve_min=0.0,
+        gcor_strong_arm_min=0.5,
         gcor_low_signal_frac=0.0,
+        small_inv_max_size=1_000_000,
+        small_rho_cutoff=0.5,
+        small_s_anti_diag_min=2.0,
+        small_flip_improve_min=0.2,
         tip_min_s_occupancy=0.15,
         tip_max_s_gap_frac=0.70,
         tip_allow_nan_corner=True,
-        tip_anti_diag_rescue=True,
+        tip_anti_diag_rescue=False,
         tip_anti_diag_min=3.0,
         tip_anti_diag_min_size=3_000_000,
         tip_anti_diag_max_size=30_000_000,
@@ -6035,46 +6058,53 @@ def merge_multiscale_results(args):
         )
 
 
+        flip_vals=pd.to_numeric(
+            group.get("flip_improve", pd.Series(dtype=float)),
+            errors="coerce"
+        )
+        flip_vals=flip_vals[np.isfinite(flip_vals)]
+        flip_improve=(
+            float(flip_vals.mean()) if len(flip_vals) else float("nan")
+        )
+        # Prefer source GCOR ρ from the representative call when present.
+        left_rho=float(representative.get("left_rho", np.nan))
+        right_rho=float(representative.get("right_rho", np.nan))
+        if not np.isfinite(left_rho):
+            left_rho=float(np.mean(features[list(nodes),4]))
+        if not np.isfinite(right_rho):
+            right_rho=float(np.mean(features[list(nodes),5]))
+        if "flip_improve" in representative.index:
+            fr=pd.to_numeric(representative.get("flip_improve"), errors="coerce")
+            if np.isfinite(fr):
+                flip_improve=float(fr)
+
         merged.append({
             "cluster_id":cid,
             "chrom":str(group["chrom"].iloc[0]),
-            "core_start":core_start,
-            "core_end":core_end,
-            "core_size":int(core_end-core_start),
-            "full_start":full_start,
-            "full_end":full_end,
-            "full_size":int(full_end-full_start),
             "start":full_start,
             "end":full_end,
             "size":int(full_end-full_start),
             "scale_support":support,
-            "call_support":len(group),
             "resolutions":",".join(
                 str(x) for x in sorted(group["resolution"].unique())
             ),
-            "representative_resolution":int(representative["resolution"]),
-            "representative_source":representative["source_file"],
-            "max_signal":float(max(strengths)),
+            "left_rho":left_rho,
+            "right_rho":right_rho,
+            "flip_improve":flip_improve,
             "event_score":event_score,
+            "arm_expanded":0,
+            # keep full/core temporarily for arm-expand / dedup; slimmed later
+            "full_start":full_start,
+            "full_end":full_end,
+            "full_size":int(full_end-full_start),
+            "core_start":core_start,
+            "core_end":core_end,
+            "core_size":int(core_end-core_start),
+            "call_support":len(group),
+            "representative_resolution":int(representative["resolution"]),
+            "max_signal":float(max(strengths)),
             "left_scale_support":left_support,
             "right_scale_support":right_support,
-            "mean_row_rho":float(np.mean(features[list(nodes),0])),
-            "mean_column_rho":float(np.mean(features[list(nodes),1])),
-            "mean_boundary_left_rho":float(
-                np.mean(features[list(nodes),2])
-            ),
-            "mean_boundary_right_rho":float(
-                np.mean(features[list(nodes),3])
-            ),
-            "mean_source_left_rho":float(
-                np.mean(features[list(nodes),4])
-            ),
-            "mean_source_right_rho":float(
-                np.mean(features[list(nodes),5])
-            ),
-            "community_count_mean":float(
-                np.mean(features[list(nodes),9])
-            )
         })
 
 
@@ -6200,7 +6230,7 @@ def parse_workflow_args():
         default=False,
         help="use ICE-balanced contacts (default: --no-balance, raw counts)"
     )
-    parser.add_argument("--min-support",type=int,default=2)
+    parser.add_argument("--min-support",type=int,default=1)
     parser.add_argument("--min-community-size",type=int,default=500_000)
     parser.add_argument("--max-merge-gap",type=int,default=2_000_000)
     parser.add_argument("--max-inversion-size",type=int,default=100_000_000)
@@ -6247,9 +6277,13 @@ def parse_workflow_args():
         help="min S×S anti/background ratio for tip bowtie rescue (default: 3)"
     )
     parser.add_argument(
-        "--no-tip-anti-diag-rescue",
-        action="store_true",
-        help="disable chrom-tip S×S anti-diagonal grow rescue"
+        "--tip-anti-diag-rescue",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "enable chrom-tip S×S anti-diagonal grow rescue "
+            "(default: off; use --tip-anti-diag-rescue to turn on)"
+        )
     )
     parser.add_argument(
         "--tip-min-s-occupancy",
@@ -6283,6 +6317,12 @@ def parse_workflow_args():
         )
     )
     parser.add_argument(
+        "--rho-cutoff",
+        type=float,
+        default=0.3,
+        help="GCOR |Spearman ρ| cutoff for normal communities (default: 0.3)"
+    )
+    parser.add_argument(
         "--large-block-min-size",
         type=int,
         default=15_000_000,
@@ -6300,18 +6340,7 @@ def parse_workflow_args():
         default=0.0,
         help=(
             "drop flank×S rows/cols with mean < frac×median before GCOR "
-            "(default: 0.0; <=0 off). Was tightened to 0.3 in a later "
-            "revision and zeroed all sim INV calls; keep off by default."
-        )
-    )
-    parser.add_argument(
-        "--s-anti-diag-min",
-        type=float,
-        default=0.0,
-        help=(
-            "min S×S anti/bg ratio for internal INV (default: 0.0=off). "
-            "Global anti-diag gating wiped sim INV; use per-call small-INV "
-            "logic / tip rescue instead."
+            "(default: 0.0; <=0 off)"
         )
     )
     parser.add_argument(
@@ -6320,8 +6349,46 @@ def parse_workflow_args():
         default=0.0,
         help=(
             "min flip continuity delta to accept INV (default: 0.0; "
-            "< -1e8 disables). Match PHASC-main successful sim run."
+            "< -1e8 disables)"
         )
+    )
+    parser.add_argument(
+        "--gcor-strong-arm-min",
+        type=float,
+        default=0.5,
+        help=(
+            "require max(|ρL|, |ρR|) >= this to accept INV "
+            "(default: 0.5; <=0 off)"
+        )
+    )
+    parser.add_argument(
+        "--small-inv-max-size",
+        type=int,
+        default=1_000_000,
+        help=(
+            "|S| <= this uses small-call gates: tighter ρ, flip, anti-diag "
+            "(default: 1000000; <=0 disables)"
+        )
+    )
+    parser.add_argument(
+        "--small-rho-cutoff",
+        type=float,
+        default=0.5,
+        help="GCOR |ρ| cutoff for small calls (default: 0.5)"
+    )
+    parser.add_argument(
+        "--small-s-anti-diag-min",
+        type=float,
+        default=2.0,
+        help=(
+            "S×S anti/bg min for small internal INV (default: 2.0; <=0 off)"
+        )
+    )
+    parser.add_argument(
+        "--small-flip-improve-min",
+        type=float,
+        default=0.2,
+        help="flip continuity min for small calls (default: 0.2)"
     )
     parser.add_argument(
         "--parallel-diag-max",
@@ -6334,22 +6401,12 @@ def parse_workflow_args():
         )
     )
     parser.add_argument(
-        "--offdiag-fill-max",
-        type=float,
-        default=0.0,
-        help=(
-            "max mean(|i-j|>=3)/mean(1<=|i-j|<=2) inside S; rejects blocky "
-            "fill (default: 0.0=off). Enabling at 0.25 zeroed sim INV merge."
-        )
-    )
-    parser.add_argument(
         "--direction-lambda",
         type=float,
         default=2.0,
         help=(
             "adjacent-edge direction fusion strength in Louvain graph "
-            "(default: 2.0; PHASC-main / working sim INV). 0.5 changes "
-            "communities enough that multiscale merge can become empty."
+            "(default: 2.0)"
         )
     )
     parser.add_argument(
@@ -6361,31 +6418,28 @@ def parse_workflow_args():
             "(default: 2.0; <=0 disables secondary split)"
         )
     )
-    parser.add_argument(
-        "--parallel-mass-frac-max",
-        type=float,
-        default=0.0,
-        help=(
-            "deprecated (length gate only); kept for CLI compat, ignored"
-        )
-    )
     args=parser.parse_args()
-    args.tip_anti_diag_rescue=not args.no_tip_anti_diag_rescue
+    args.tip_anti_diag_rescue=bool(args.tip_anti_diag_rescue)
+    args.gcor_strong_arm_min=float(
+        getattr(args,"gcor_strong_arm_min",0.5)
+    )
     args.tip_anti_diag_min=float(args.tip_anti_diag_min)
     args.tip_min_s_occupancy=float(args.tip_min_s_occupancy)
     args.tip_max_s_gap_frac=float(args.tip_max_s_gap_frac)
     args.tip_orphan_ratio=float(args.tip_orphan_ratio)
     args.native_coarse_louvain=bool(args.native_coarse_louvain)
+    args.rho_cutoff=float(args.rho_cutoff)
     args.large_block_min_size=int(args.large_block_min_size)
     args.large_block_rho_cutoff=float(args.large_block_rho_cutoff)
     args.gcor_low_signal_frac=float(args.gcor_low_signal_frac)
-    args.s_anti_diag_min=float(args.s_anti_diag_min)
     args.flip_improve_min=float(args.flip_improve_min)
+    args.small_inv_max_size=int(args.small_inv_max_size)
+    args.small_rho_cutoff=float(args.small_rho_cutoff)
+    args.small_s_anti_diag_min=float(args.small_s_anti_diag_min)
+    args.small_flip_improve_min=float(args.small_flip_improve_min)
     args.parallel_diag_max=float(args.parallel_diag_max)
-    args.offdiag_fill_max=float(args.offdiag_fill_max)
     args.direction_lambda=float(args.direction_lambda)
     args.secondary_louvain_resolution=float(args.secondary_louvain_resolution)
-    args.parallel_mass_frac_max=float(args.parallel_mass_frac_max)
     # kebab → snake aliases used by original_detection_command
     args.tip_anti_diag_min_size=3_000_000
     args.tip_anti_diag_max_size=30_000_000
@@ -6439,7 +6493,6 @@ def original_detection_command(
         "--corner_diag_bg_min","0",
         "--lattice_peak_max","0.30",
         "--parallel_diag_max",str(getattr(args,"parallel_diag_max",0.30)),
-        "--offdiag_fill_max",str(getattr(args,"offdiag_fill_max",0.0)),
         "--s_qc_resolution","50000",
         "--min_s_occupancy","0.60",
         "--max_s_gap_frac","0.25",
@@ -6456,6 +6509,7 @@ def original_detection_command(
             getattr(args,"tip_anti_diag_max_tiles",12)
         ),
         "--tip_orphan_ratio",str(getattr(args,"tip_orphan_ratio",0.25)),
+        "--rho_cutoff",str(getattr(args,"rho_cutoff",0.3)),
         "--large_block_min_size",str(
             getattr(args,"large_block_min_size",15_000_000)
         ),
@@ -6471,10 +6525,21 @@ def original_detection_command(
         "--gcor_low_signal_frac",str(
             getattr(args,"gcor_low_signal_frac",0.0)
         ),
-        "--s_anti_diag_min",str(getattr(args,"s_anti_diag_min",0.0)),
         "--flip_improve_min",str(getattr(args,"flip_improve_min",0.0)),
+        "--gcor_strong_arm_min",str(
+            getattr(args,"gcor_strong_arm_min",0.5)
+        ),
+        "--small_inv_max_size",str(
+            getattr(args,"small_inv_max_size",1_000_000)
+        ),
+        "--small_rho_cutoff",str(getattr(args,"small_rho_cutoff",0.5)),
+        "--small_s_anti_diag_min",str(
+            getattr(args,"small_s_anti_diag_min",2.0)
+        ),
+        "--small_flip_improve_min",str(
+            getattr(args,"small_flip_improve_min",0.2)
+        ),
         "--gap_oneside_min_frac","0.10",
-        "--gap_oneside_corner_min","1.20",
         "--oneside_min_size","8000000",
         "--gcor_max_gap_bp","2000000",
         "--gap_cluster_diag_frac","0.35",
@@ -6485,7 +6550,7 @@ def original_detection_command(
         "--secondary_split_min_size","3000000",
         ("--balance" if getattr(args,"balance",False) else "--no-balance"),
     ]
-    if bool(getattr(args,"tip_anti_diag_rescue",True)):
+    if bool(getattr(args,"tip_anti_diag_rescue",False)):
         command.append("--tip_anti_diag_rescue")
     else:
         command.append("--no-tip_anti_diag_rescue")
@@ -6954,6 +7019,52 @@ def recheck_expanded_span(mat,seed_i,seed_j,new_i,new_j):
     )
 
 
+FINAL_INV_COLUMNS=(
+    "cluster_id",
+    "chrom",
+    "start",
+    "end",
+    "size",
+    "scale_support",
+    "resolutions",
+    "left_rho",
+    "right_rho",
+    "flip_improve",
+    "event_score",
+    "arm_expanded",
+)
+
+
+def slim_final_inv_table(calls):
+    """Keep a short final TSV: coords + GCOR ρ + flipΔ."""
+    if calls is None or calls.empty:
+        return pd.DataFrame(columns=list(FINAL_INV_COLUMNS))
+    out=calls.copy()
+    # Compat with older fat tables
+    if "left_rho" not in out.columns and "mean_source_left_rho" in out.columns:
+        out["left_rho"]=out["mean_source_left_rho"]
+    if "right_rho" not in out.columns and "mean_source_right_rho" in out.columns:
+        out["right_rho"]=out["mean_source_right_rho"]
+    if "flip_improve" not in out.columns:
+        out["flip_improve"]=np.nan
+    if "arm_expanded" not in out.columns:
+        out["arm_expanded"]=0
+    if "event_score" not in out.columns and "max_signal" in out.columns:
+        out["event_score"]=out["max_signal"]
+    keep=[c for c in FINAL_INV_COLUMNS if c in out.columns]
+    out=out[keep].copy()
+    for c in FINAL_INV_COLUMNS:
+        if c not in out.columns:
+            out[c]=0 if c in ("scale_support","arm_expanded","size") else (
+                np.nan if c in ("left_rho","right_rho","flip_improve","event_score")
+                else ""
+            )
+    out=out[list(FINAL_INV_COLUMNS)]
+    if "cluster_id" in out.columns:
+        out["cluster_id"]=np.arange(1,len(out)+1)
+    return out.reset_index(drop=True)
+
+
 def expand_inversion_calls(mcool_file,calls,resolution,balance=False):
     """
     Post-merge: expand truncated INV arms across short gaps, then arm-enrichment
@@ -7285,15 +7396,29 @@ def plot_local_inversions(mcool_file,calls,resolutions,image_dir,balance=False):
             for value in str(call.resolutions).split(",")
             if str(value).strip() and str(value).strip().lower()!="nan"
         )
+        def _fmt_rho(val):
+            try:
+                v=float(val)
+            except (TypeError,ValueError):
+                return "NA"
+            return f"{v:+.3f}" if np.isfinite(v) else "NA"
+        left_rho=call.get("left_rho", call.get("mean_source_left_rho", np.nan))
+        right_rho=call.get("right_rho", call.get("mean_source_right_rho", np.nan))
+        flip_d=call.get("flip_improve", np.nan)
+        stats_line=(
+            f"ρL={_fmt_rho(left_rho)}  ρR={_fmt_rho(right_rho)}  "
+            f"flipΔ={_fmt_rho(flip_d)}"
+        )
         figure.suptitle(
             f"INV{int(call.cluster_id)} | {chrom}  "
             f"{start/1e6:.2f}–{end/1e6:.2f} Mb\n"
             f"support: {int(call.scale_support)} scales"
-            f"{f' ({scale_text})' if scale_text else ''}",
-            fontsize=12,linespacing=1.2,y=0.98
+            f"{f' ({scale_text})' if scale_text else ''}\n"
+            f"{stats_line}",
+            fontsize=11,linespacing=1.25,y=0.99
         )
-        figure.tight_layout(rect=[0.02,0.02,0.98,0.93])
-        figure.subplots_adjust(wspace=0.22,top=0.90)
+        figure.tight_layout(rect=[0.02,0.02,0.98,0.90])
+        figure.subplots_adjust(wspace=0.22,top=0.86)
         filename=f"INV{int(call.cluster_id):04d}_{chrom}_{start}_{end}.png"
         figure.savefig(local_dir/filename,dpi=180,bbox_inches="tight")
         plt.close(figure)
@@ -7330,6 +7455,124 @@ def collage_local_inversions(local_dir,out_path,columns=3,pad=12,bg=255):
     return out_path
 
 
+def plot_flipped_inversions(mcool_file,calls,resolutions,image_dir,balance=False):
+    """
+    Two-row panels per INV: original (top) vs S-flipped (bottom) at each
+    detection-scale resolution (typically 50/100/200/500 kb).
+    """
+    del balance
+    if calls is None or getattr(calls, "empty", True):
+        return None
+    flip_dir=Path(image_dir)
+    flip_dir.mkdir(parents=True,exist_ok=True)
+    plot_mcool=resolve_plot_mcool(mcool_file)
+    available=available_resolutions(plot_mcool) or list(resolutions)
+    want=sorted(
+        int(r) for r in (50_000,100_000,200_000,500_000)
+        if int(r) in set(available)
+    )
+    if not want:
+        want=sorted(int(r) for r in resolutions if int(r) in set(available))
+    if not want:
+        want=list(available)
+    coolers={
+        resolution:cooler.Cooler(f"{plot_mcool}::resolutions/{resolution}")
+        for resolution in want
+    }
+    base_clr=coolers[want[0]]
+
+    def _flip_delta(chrom,s0,s1,res,chrom_size):
+        flank=max(s1-s0,5*res)
+        l0=max(0,s0-flank)
+        r1=min(chrom_size,s1+flank)
+        full=np.nan_to_num(
+            np.asarray(
+                coolers[res].matrix(balance=False).fetch((chrom,l0,r1)),
+                float,
+            ),
+            nan=0.0,
+        )
+        left=(0,s0-l0) if s0>0 else None
+        right=(s1-l0,r1-l0) if s1<chrom_size else None
+        if left is None and right is None:
+            return float("nan")
+        try:
+            d,_,_=flip_improvement_score(
+                full,left,(s0-l0,s1-l0),right,res
+            )
+            return float(d)
+        except Exception:
+            return float("nan")
+
+    for _,call in calls.iterrows():
+        chrom=str(call.chrom)
+        s0,s1=int(call.start),int(call.end)
+        chrom_size=int(base_clr.chromsizes[chrom])
+        w0,w1=local_plot_window(s0,s1,chrom_size)
+        res_ref=100_000 if 100_000 in want else want[0]
+        dlt=_flip_delta(chrom,s0,s1,res_ref,chrom_size)
+        n=len(want)
+        figure,axes=plt.subplots(2,n,figsize=(3.8*n,8.2),squeeze=False)
+        for j,res in enumerate(want):
+            raw=coolers[res].matrix(balance=False).fetch((chrom,w0,w1))
+            raw=np.nan_to_num(
+                np.asarray(raw,float),nan=0.0,posinf=0.0,neginf=0.0
+            )
+            i0=max(0,(s0-w0)//res)
+            i1=min(raw.shape[0],int(np.ceil((s1-w0)/res)))
+            flipped=flip_interval_in_matrix(raw,i0,i1)
+            orig=np.log1p(np.maximum(raw,0.0))
+            flip=np.log1p(np.maximum(flipped,0.0))
+            norm=local_heatmap_norm(orig)
+            for row,mat,title in (
+                (0,orig,"original"),
+                (1,flip,"S flipped"),
+            ):
+                ax=axes[row,j]
+                draw_hic(ax,mat,local=True,norm=norm)
+                mark_inversion(
+                    ax,(s0-w0)/res,(s1-w0)/res,linewidth=1.4
+                )
+                ax.set_title(
+                    f"{res/1e3:.0f} kb | {title}",
+                    fontsize=11,weight="bold",pad=4
+                )
+                _style_hic_axes(ax,w0,res,ylabel=(j==0))
+                if j>0:
+                    ax.tick_params(axis="y",labelleft=False)
+
+        def _fmt_rho(val):
+            try:
+                v=float(val)
+            except (TypeError,ValueError):
+                return "NA"
+            return f"{v:+.3f}" if np.isfinite(v) else "NA"
+
+        left_rho=call.get("left_rho",call.get("mean_source_left_rho",np.nan))
+        right_rho=call.get("right_rho",call.get("mean_source_right_rho",np.nan))
+        flip_d=call.get("flip_improve",np.nan)
+        dlt_s=(
+            f"{dlt:+.3f}" if np.isfinite(dlt) else "NA"
+        )
+        figure.suptitle(
+            f"INV{int(call.cluster_id)} | {chrom}  "
+            f"{s0/1e6:.2f}–{s1/1e6:.2f} Mb\n"
+            f"ρL={_fmt_rho(left_rho)}  ρR={_fmt_rho(right_rho)}  "
+            f"flipΔ(table)={_fmt_rho(flip_d)}  |  S flipped | "
+            f"flipΔ({res_ref//1000}kb)={dlt_s}",
+            fontsize=11,linespacing=1.25,y=0.995
+        )
+        figure.tight_layout(rect=[0.02,0.02,0.98,0.90])
+        figure.subplots_adjust(wspace=0.22,hspace=0.28,top=0.86)
+        filename=(
+            f"INV{int(call.cluster_id):04d}_{chrom}_{s0}_{s1}_flipped.png"
+        )
+        figure.savefig(flip_dir/filename,dpi=160,bbox_inches="tight")
+        plt.close(figure)
+    print(f"[INFO] flipped panels -> {flip_dir}",flush=True)
+    return flip_dir
+
+
 def render_hic_images(mcool_file,result,resolutions,outdir,balance=False):
     image_dir=Path(outdir)/"HiC_images"
     image_dir.mkdir(parents=True,exist_ok=True)
@@ -7347,6 +7590,11 @@ def render_hic_images(mcool_file,result,resolutions,outdir,balance=False):
     )
     plot_local_inversions(
         mcool_file,result,resolutions,image_dir,balance=balance
+    )
+    plot_flipped_inversions(
+        mcool_file,result,resolutions,
+        Path(outdir)/"HiC_images_flipped",
+        balance=balance,
     )
     return image_dir
 
@@ -7554,17 +7802,21 @@ def workflow_main():
         )
 
     result_path=outdir/"ALL_INV_multiscale.tsv"
-    if result.empty:
-        pd.DataFrame(columns=[
-            "cluster_id","chrom","start","end","size","scale_support",
-            "call_support","resolutions"
-        ]).to_csv(result_path,sep="\t",index=False)
-    else:
-        result.to_csv(result_path,sep="\t",index=False)
+    # Keep a working copy with any extra fields needed for plotting, then
+    # write the slim public table.
+    plot_result=result.copy() if result is not None else result
+    result=slim_final_inv_table(result)
+    result.to_csv(result_path,sep="\t",index=False)
 
-    if not result.empty and not bool(getattr(args, "no_plot", False)):
+    if not plot_result.empty and not bool(getattr(args, "no_plot", False)):
+        # Ensure plot annotations see the same ρ / flip columns as the TSV.
+        for col in ("left_rho","right_rho","flip_improve"):
+            if col in result.columns and col not in plot_result.columns:
+                plot_result[col]=result[col]
+            elif col in result.columns:
+                plot_result[col]=result[col].values
         render_hic_images(
-            args.mcool_file,result,resolutions,outdir,
+            args.mcool_file,plot_result,resolutions,outdir,
             balance=bool(args.balance)
         )
     elif bool(getattr(args, "no_plot", False)):
