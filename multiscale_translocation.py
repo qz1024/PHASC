@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import random
 import re
 from pathlib import Path
 
@@ -760,12 +761,13 @@ def build_clear_insert_relations(
     min_flank_bp: int = 500_000,
     max_residual_frac: float = 0.25,
     min_cover_frac: float = 0.5,
+    seed: int = 42,
 ) -> tuple[list[tuple[int, int, int, int]], list[dict]]:
     """Return (fill triples, mutual_records).
 
     i clearly fills a residual gap between two consecutive *same-label*
-    community pieces. Mutual A<->B pairs are dropped from fills at this
-    resolution (ambiguous); records are kept for cross-resolution recovery.
+    community pieces. Mutual A<->B (A B C D -> A C B D: both views valid):
+    randomly keep one inserter, drop the other.
     """
     merged_blocks = merged_blocks or {}
     fills: list[tuple[int, int, int, int]] = []
@@ -831,15 +833,13 @@ def build_clear_insert_relations(
                     fills.append((i, j, res_l, res_r))
                     fill_meta.append((i, j, res_l, res_r, ls, rs))
 
-    # Mutual A<->B: ambiguous — drop both inserters (do not call either as TRA).
+    # Mutual A<->B: both views valid (A B C D -> A C B D).
+    # Randomly keep one inserter; drop the other. Eval treats either as TP.
     pair_set = {(i, j) for i, j, _a, _b in fills}
-    mutual_inserters: set[int] = set()
     mutual_pairs: list[tuple[int, int]] = []
     seen_pair: set[tuple[int, int]] = set()
     for i, j in pair_set:
         if (j, i) in pair_set:
-            mutual_inserters.add(i)
-            mutual_inserters.add(j)
             a, b = (i, j) if i < j else (j, i)
             if (a, b) not in seen_pair:
                 seen_pair.add((a, b))
@@ -860,13 +860,18 @@ def build_clear_insert_relations(
         _boost, score, ls, rs, gl, gr = best
         return score, ls, rs, gl, gr
 
+    rng = random.Random(int(seed))
+    drop_inserters: set[int] = set()
     mutual_records: list[dict] = []
     for a, b in mutual_pairs:
         sa, lsa, rsa, gla, gra = _best_flank_score(a, b)
         sb, lsb, rsb, glb, grb = _best_flank_score(b, a)
-        for idx, score, ls, rs, gl, gr, other in (
-            (a, sa, lsa, rsa, gla, gra, b),
-            (b, sb, lsb, rsb, glb, grb, a),
+        keep = rng.choice([a, b])
+        drop = b if keep == a else a
+        drop_inserters.add(drop)
+        for idx, score, ls, rs, gl, gr, other, decision in (
+            (a, sa, lsa, rsa, gla, gra, b, "keep" if keep == a else "drop"),
+            (b, sb, lsb, rsb, glb, grb, a, "keep" if keep == b else "drop"),
         ):
             r = rows[idx]
             o = rows[other]
@@ -889,11 +894,12 @@ def build_clear_insert_relations(
                     "other_start": int(o["start"]),
                     "other_end": int(o["end"]),
                     "other_cluster_id": int(o.get("cluster_id", other + 1)),
+                    "mutual_decision": decision,
                 }
             )
 
-    if mutual_inserters:
-        fills = [t for t in fills if t[0] not in mutual_inserters]
+    if drop_inserters:
+        fills = [t for t in fills if t[0] not in drop_inserters]
     return fills, mutual_records
 
 
@@ -1287,6 +1293,7 @@ def iterate_clear_insert(
     min_flank_bp: int = 500_000,
     max_residual_frac: float = 0.25,
     min_cover_frac: float = 0.5,
+    seed: int = 42,
 ) -> tuple[pd.DataFrame, list[dict], list[dict], list[dict]]:
     """Run clear-insert ILP rounds with merged wholes until no new accepts.
 
@@ -1311,15 +1318,17 @@ def iterate_clear_insert(
             min_flank_bp=min_flank_bp,
             max_residual_frac=max_residual_frac,
             min_cover_frac=min_cover_frac,
+            seed=int(seed) + rnd,
         )
         if mutual_recs:
             for rec in mutual_recs:
                 rec = dict(rec)
                 rec["round"] = rnd
                 all_mutual.append(rec)
+            n_pairs = sum(1 for r in mutual_recs if r.get("mutual_decision") == "keep")
             print(
-                f"[round {rnd}] mutual_dropped={len(mutual_recs)//2} pairs "
-                f"(both sides skipped)",
+                f"[round {rnd}] mutual={n_pairs} pairs "
+                f"(randomly keep one side)",
                 flush=True,
             )
         conf = build_conflicts(active)
@@ -1853,36 +1862,59 @@ def plot_resolution_community(
     print(f"[INFO] wrote {out_path}", flush=True)
 
 
+def _calls_abut(a0: int, a1: int, b0: int, b1: int, slack: int = 500_000) -> bool:
+    """True if intervals touch or nearly touch (reciprocal TRA neighbors)."""
+    if a1 <= b0:
+        return (b0 - a1) <= slack
+    if b1 <= a0:
+        return (a0 - b1) <= slack
+    return _overlap(a0, a1, b0, b1) > 0
+
+
 def evaluate_against_truth(calls: pd.DataFrame, truth: pd.DataFrame, thr: float = 0.5):
+    """Score calls vs truth TRA intervals.
+
+    A B C D -> A C B D: calling B *or* the abutting C are both correct for
+    that event. Match by reciprocal overlap, or by abutting a truth TRA
+    (reciprocal insert view). Recall = fraction of truth events hit either way.
+    """
     tra = truth[truth["svtype"] == "TRA"]
-    pred = calls.copy()
+    pred = calls.copy().reset_index(drop=True)
     matched = set()
+    details: list[tuple] = []
     tp = fp = 0
-    details = []
+
     for _, r in pred.iterrows():
-        best_name, best_rec = None, 0.0
+        best_name, best_rec, how = None, 0.0, None
+        p0, p1 = int(r["start"]), int(r["end"])
         for _, t in tra.iterrows():
-            rec = _reciprocal(int(r.start), int(r.end), int(t.start), int(t.end))
-            if rec > best_rec:
-                best_rec = rec
-                best_name = t["name"]
-        ok = best_name is not None and best_rec >= thr
-        if ok:
+            t0, t1 = int(t["start"]), int(t["end"])
+            rec = _reciprocal(p0, p1, t0, t1)
+            if rec >= thr and (how != "overlap" or rec > best_rec):
+                best_name, best_rec, how = t["name"], rec, "overlap"
+            elif how is None and _calls_abut(p0, p1, t0, t1):
+                best_name, best_rec, how = t["name"], rec, "recip"
+        if how is not None:
             tp += 1
             matched.add(best_name)
+            tag = "TP" if how == "overlap" else "TP_recip"
         else:
             fp += 1
-        details.append((int(r.get("cluster_id", -1)), best_name, round(best_rec, 3), "TP" if ok else "FP"))
+            tag = "FP"
+        details.append(
+            (int(r.get("cluster_id", -1)), best_name, round(best_rec, 3), tag)
+        )
+
     fn = [t["name"] for _, t in tra.iterrows() if t["name"] not in matched]
     prec = tp / max(1, tp + fp)
-    rec = tp / max(1, len(tra))
-    f1 = 0.0 if prec + rec == 0 else 2 * prec * rec / (prec + rec)
+    recall = len(matched) / max(1, len(tra))
+    f1 = 0.0 if prec + recall == 0 else 2 * prec * recall / (prec + recall)
     return {
         "tp": tp,
         "fp": fp,
         "fn": len(fn),
         "precision": prec,
-        "recall": rec,
+        "recall": recall,
         "f1": f1,
         "matched": sorted(matched),
         "fn_names": fn,
@@ -2083,6 +2115,7 @@ def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
             out, history, units, mutual_recs = iterate_clear_insert(
                 calls,
                 min_true_fold=args.min_true_fold,
+                seed=args.seed,
             )
             out = out.copy()
             out["gamma"] = gamma
