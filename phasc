@@ -26,7 +26,7 @@ def print_help_message():
   \033[1mphasc\033[0m <command> [options...]
 
 \033[1;34mCOMMANDS:\033[0m
-  \033[1mpreprocess\033[0m       Map Hi-C reads with chromap, create genome-wide mcool,
+  \033[1mpreprocess\033[0m       Map Hi-C once (chromap -q 0), filter INV/TRA MAPQ, two mcools
                    for downstream PHASC detection                              (preprocess.py)
   \033[1minversion\033[0m        Detect multi-scale inversions from mcool data               (multiscale_inversion.py)
   \033[1mtranslocation\033[0m    Detect intra-chromosomal translocations from mcool data     (multiscale_translocation.py)
@@ -34,11 +34,14 @@ def print_help_message():
 
 \033[1;34mEXAMPLE:\033[0m
   phasc preprocess -r genome.fa -1 hic_R1.fq.gz -2 hic_R2.fq.gz \\
-                  [ -o preprocess_out ] [ -p sample ] [ -t 16 ]
+                  [ -o preprocess_out ] [ -p sample ] [ -t 16 ] \\
+                  [ --inv-mapq 0 ] [ --tra-mapq 1 ]   # filter from MAPQ-0 pairs
 
-  phasc translocation --mcool preprocess_out/sample.mcool --outdir TRA_results --chrom chr3B
-  phasc inversion preprocess_out/sample.mcool --outdir INV_results
-  phasc pipeline preprocess_out/sample.mcool -o PHASC_results --jobs 4 --chromosomes chr3B
+  phasc translocation --mcool preprocess_out/sample.tra.mapq1.mcool --outdir TRA_results --chrom chr3B
+  phasc inversion preprocess_out/sample.inv.mapq0.mcool --outdir INV_results
+  phasc pipeline --inv-mcool preprocess_out/sample.inv.mapq0.mcool \\
+                 --tra-mcool preprocess_out/sample.tra.mapq1.mcool \\
+                 -o PHASC_results --jobs 4 --chromosomes chr3B
 
 \033[1;34mTIPS:\033[0m
   Use phasc <command> --help to show options for one command.

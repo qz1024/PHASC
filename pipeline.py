@@ -219,10 +219,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Run PHASC inversion and translocation detection in parallel "
-            "and write both results into the same --outdir"
+            "and write both results into the same --outdir. "
+            "Prefer separate preprocess mcools (INV MAPQ / TRA MAPQ); "
+            "a single positional mcool is still accepted for both."
         )
     )
-    parser.add_argument("mcool", help="input .mcool file")
+    parser.add_argument(
+        "mcool",
+        nargs="?",
+        default=None,
+        help="shared .mcool used for both INV and TRA when --inv-mcool/--tra-mcool omitted",
+    )
+    parser.add_argument(
+        "--inv-mcool",
+        default=None,
+        help="inversion .mcool (e.g. preprocess *.inv.mapq0.mcool)",
+    )
+    parser.add_argument(
+        "--tra-mcool",
+        default=None,
+        help="translocation .mcool (e.g. preprocess *.tra.mapq1.mcool)",
+    )
     parser.add_argument(
         "-o",
         "--outdir",
@@ -330,9 +347,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.inv_min_support < 1:
         parser.error("--inv-min-support must be >= 1")
 
-    mcool = Path(args.mcool).expanduser().resolve()
-    if not mcool.is_file():
-        raise SystemExit(f"[ERROR] mcool not found: {mcool}")
+    shared = Path(args.mcool).expanduser().resolve() if args.mcool else None
+    inv_mcool_arg = args.inv_mcool or args.mcool
+    tra_mcool_arg = args.tra_mcool or args.mcool
+    if not inv_mcool_arg or not tra_mcool_arg:
+        parser.error(
+            "provide a positional mcool, or both --inv-mcool and --tra-mcool"
+        )
+
+    inv_mcool = Path(inv_mcool_arg).expanduser().resolve()
+    tra_mcool = Path(tra_mcool_arg).expanduser().resolve()
+    for label, path in (("INV", inv_mcool), ("TRA", tra_mcool)):
+        if not path.is_file():
+            raise SystemExit(f"[ERROR] {label} mcool not found: {path}")
 
     for name in ("fasta", "hic_alignments", "truth"):
         value = getattr(args, name)
@@ -359,14 +386,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.chromosomes:
         chrom = args.chromosomes.split(",")[0].strip()
     else:
-        chrom = _first_chrom_from_mcool(mcool)
+        chrom = _first_chrom_from_mcool(tra_mcool if tra_mcool else inv_mcool)
 
     balance_flag = "--balance" if args.balance else "--no-balance"
 
     inv_cmd = [
         sys.executable,
         str(inv_script),
-        str(mcool),
+        str(inv_mcool),
         balance_flag,
         "--outdir",
         str(inv_work),
@@ -389,7 +416,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.executable,
         str(tra_script),
         "--mcool",
-        str(mcool),
+        str(tra_mcool),
         "--outdir",
         str(tra_work),
         "--chrom",
@@ -416,6 +443,10 @@ def main(argv: list[str] | None = None) -> int:
         f"balance={bool(args.balance)} chrom={chrom}",
         flush=True,
     )
+    print(f"[INFO] INV mcool={inv_mcool}", flush=True)
+    print(f"[INFO] TRA mcool={tra_mcool}", flush=True)
+    if shared is not None and inv_mcool == tra_mcool == shared:
+        print("[INFO] using shared mcool for both detectors", flush=True)
     print("[INFO] running inversion + translocation in parallel", flush=True)
 
     errors: list[tuple[str, BaseException]] = []

@@ -41,7 +41,7 @@ which chromap cooler
 ## Quick start
 
 ```bash
-# 1. Map Hi-C reads and build a genome-wide mcool
+# 1. Map Hi-C once (-q 0), filter pairs, build INV + TRA mcools
 ./phasc preprocess \
   -r genome.fa \
   -1 hic_R1.fq.gz \
@@ -51,13 +51,16 @@ which chromap cooler
   -t 16
 
 # 2. Detect inversions
-./phasc inversion preprocess_out/sample.mcool --outdir INV_results
+./phasc inversion preprocess_out/sample.inv.mapq0.mcool --outdir INV_results
 
 # 3. Detect intra-chromosomal translocations
-./phasc translocation --mcool preprocess_out/sample.mcool --outdir TRA_results --chrom chr3B
+./phasc translocation --mcool preprocess_out/sample.tra.mapq1.mcool --outdir TRA_results --chrom chr3B
 
-# 4. Or run INV + TRA together
-./phasc pipeline preprocess_out/sample.mcool -o PHASC_results --jobs 4 --chromosomes chr3B
+# 4. Or run INV + TRA together on the two MAPQ mcools
+./phasc pipeline \
+  --inv-mcool preprocess_out/sample.inv.mapq0.mcool \
+  --tra-mcool preprocess_out/sample.tra.mapq1.mcool \
+  -o PHASC_results --jobs 4 --chromosomes chr3B
 ```
 
 
@@ -72,7 +75,7 @@ which chromap cooler
 
 | Command         | Script                        | Description                                             |
 | --------------- | ----------------------------- | ------------------------------------------------------- |
-| `preprocess`    | `preprocess.py`               | Map Hi-C with chromap → `.pairs` → genome-wide `.mcool` |
+| `preprocess`    | `preprocess.py`               | Map Hi-C with chromap → INV/TRA `.pairs` → two `.mcool` |
 | `inversion`     | `multiscale_inversion.py`     | Multi-scale inversion detection (Louvain / GCOR)        |
 | `translocation` | `multiscale_translocation.py` | Multi-scale intra-chromosomal translocation detection   |
 | `pipeline`      | `pipeline.py`                 | Run INV + TRA in parallel into one shared outdir        |
@@ -82,7 +85,12 @@ which chromap cooler
 
 ### `preprocess`
 
-Maps paired Hi-C reads with chromap and converts the resulting `.pairs` file into a multi-resolution `.mcool` for downstream detection.
+Maps paired Hi-C reads **once** with chromap (`-q 0`), then filters that `.pairs` file to INV / TRA MAPQ thresholds and builds two multi-resolution `.mcool` files.
+
+Defaults: `--inv-mapq 0` (keep all), `--tra-mapq 1` (filter `mapq1/mapq2 >= 1`).
+
+Requires a chromap pairs header that includes `mapq1` and `mapq2` columns, e.g.
+`#columns: readID chrom1 pos1 chrom2 pos2 strand1 strand2 pair_type mapq1 mapq2`.
 
 ```bash
 ./phasc preprocess \
@@ -92,21 +100,27 @@ Maps paired Hi-C reads with chromap and converts the resulting `.pairs` file int
   -o preprocess_out \
   -p sample \
   -t 16
+# optional: --inv-mapq 0 --tra-mapq 1
 ```
 
 Useful options:
 
+- `--inv-mapq 0` — keep pairs with mapq1/mapq2 ≥ this for inversion (default: 0)
+- `--tra-mapq 1` — keep pairs with mapq1/mapq2 ≥ this for translocation (default: 1)
 - `--resolutions 10000,25000,50000,100000,250000,500000,1000000` — mcool resolutions (default shown)
-- `--skip-mapping --pairs existing.pairs` — reuse an existing pairs file
+- `--skip-mapping --pairs existing.mapq0.pairs` — reuse a MAPQ-0 pairs file and only filter + cload
 - `--chromap-index PATH` — reuse or set the chromap index path
 - `--no-balance` — skip cooler balance / balanced zoomify
 - `--dry-run` — print commands without running them
 
 Main outputs:
 
-- `preprocess_out/sample.mcool` — genome-wide multi-resolution contact map
+- `preprocess_out/sample.mapq0.pairs` — chromap output (MAPQ ≥ 0)
+- `preprocess_out/sample.inv.mapq0.pairs` / `sample.tra.mapq1.pairs` — filtered pairs
+- `preprocess_out/sample.inv.mapq0.mcool` — INV contact map
+- `preprocess_out/sample.tra.mapq1.mcool` — TRA contact map
+- `preprocess_out/sample.mcool` — symlink/alias to the INV mcool (compatibility)
 - `preprocess_out/sample.preprocess_manifest.tsv` — output manifest
-- `preprocess_out/sample.pairs` — chromap pairs (unless reused)
 - `preprocess_out/sample.chrom.sizes` — chromosome sizes from the FASTA
 
 
@@ -167,17 +181,23 @@ Outputs:
 
 ### `pipeline`
 
-Runs inversion and translocation in parallel, then writes both result tables (and a combined `ALL_SV.tsv`) into one shared `--outdir`.
+Runs inversion and translocation in parallel, then writes both result tables (and a combined `ALL_SV.tsv`) into one shared `--outdir`. Prefer the two MAPQ-specific mcools from preprocess; a single shared mcool still works.
 
 ```bash
-./phasc pipeline preprocess_out/sample.mcool \
+./phasc pipeline \
+  --inv-mcool preprocess_out/sample.inv.mapq0.mcool \
+  --tra-mcool preprocess_out/sample.tra.mapq1.mcool \
   -o PHASC_results \
   --jobs 4 \
   --chromosomes chr3B
+
+# legacy: one mcool for both detectors
+./phasc pipeline preprocess_out/sample.mcool -o PHASC_results --jobs 4 --chromosomes chr3B
 ```
 
 Useful options:
 
+- `--inv-mcool` / `--tra-mcool` — separate contact maps (recommended after preprocess)
 - `--chromosomes chr3B` — chromosome passed to translocation (first name only)
 - `--inv-min-support 2` — inversion multiscale support threshold
 - `--min-enrichment-fold 1.5` — forwarded to translocation final gate (default 1.5)
