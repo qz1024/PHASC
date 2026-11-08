@@ -2,7 +2,7 @@
 
 **Pangenome-guided Hi-C Assembly Scaffolding and Correction**
 
-PHASC detects structural issues in genome assemblies from Hi-C contact maps. It maps paired Hi-C reads to a reference, builds a multi-resolution `.mcool` contact map, then runs multi-scale detectors for inversions and intra-chromosomal translocations.
+PHASC detects structural issues in genome assemblies from Hi-C contact maps. It maps paired Hi-C reads to a reference, builds a multi-resolution `.mcool` contact map, then runs multi-scale detectors for inversions and intra-/inter-chromosomal translocations.
 
 ## Requirements
 
@@ -54,7 +54,7 @@ which chromap cooler
 ./phasc inversion preprocess_out/sample.inv.mapq0.mcool --outdir INV_results
 
 # 3. Detect intra-chromosomal translocations
-./phasc translocation --mcool preprocess_out/sample.tra.mapq1.mcool --outdir TRA_results --chrom chr3B
+./phasc intra-translocation --mcool preprocess_out/sample.tra.mapq1.mcool --outdir TRA_results --chrom chr3B
 
 # 4. Or run INV + TRA together on the two MAPQ mcools
 ./phasc pipeline \
@@ -77,8 +77,10 @@ which chromap cooler
 | --------------- | ----------------------------- | ------------------------------------------------------- |
 | `preprocess`    | `preprocess.py`               | Map Hi-C with chromap → INV/TRA `.pairs` → two `.mcool` |
 | `inversion`     | `multiscale_inversion.py`     | Multi-scale inversion detection (Louvain / GCOR)        |
-| `translocation` | `multiscale_translocation.py` | Multi-scale intra-chromosomal translocation detection   |
-| `pipeline`      | `pipeline.py`                 | Run INV + TRA in parallel into one shared outdir        |
+| `intra-translocation` | `multiscale_intra_translocation.py` | Multi-scale intra-chromosomal translocation detection |
+| `inter-translocation` | `multiscale_inter_translocation.py` | Multi-scale inter-chromosomal translocation detection |
+| `pipeline`            | `pipeline.py`                       | Run INV + TRA in parallel into one shared outdir      |
+| `correct`       | `correct_scaffold.py`         | Correct contig mounting errors from INV/TRA vs N-gaps   |
 
 
 
@@ -148,14 +150,14 @@ Optional refinement:
 
 
 
-### `translocation`
+### `intra-translocation`
 
 Detects intra-chromosomal translocation candidates across multiple Hi-C resolutions × Louvain gammas, then merges overlapping calls.
 
 **Default flow:** cluster → score enrichment → clear-insert ILP → merge scales → **enrichment gate (`fold > 1.5`)** → `ALL_TRA.tsv`.
 
 ```bash
-./phasc translocation \
+./phasc intra-translocation \
   --mcool preprocess_out/sample.mcool \
   --outdir TRA_results \
   --chrom chr3B \
@@ -179,9 +181,34 @@ Outputs:
 - `ALL_TRA_enrichment_dropped.tsv` — rows removed by the gate
 
 
+### `inter-translocation`
+
+Detects **inter**-chromosomal translocation candidates: joint Louvain on chromA+chromB (intra + inter edges), shared communities → tip×tip O/E vs chrom-pair mean → merge scales → enrichment gate (`fold > 1.5`) → `ALL_INTER_TRA.tsv`.
+
+```bash
+./phasc inter-translocation \
+  --mcool preprocess_out/sample.tra.mapq1.mcool \
+  --outdir INTER_TRA_results \
+  --chrom-a chr1A --chrom-b chr1B \
+  --skip-plot
+```
+
+Or all unordered pairs among a chrom list:
+
+```bash
+./phasc inter-translocation \
+  --mcool preprocess_out/sample.tra.mapq1.mcool \
+  --outdir INTER_TRA_results \
+  --chromosomes chr1A,chr1B,chr2A \
+  --skip-plot
+```
+
+Useful options match intra TRA (`--resolutions`, `--gammas`, `--jobs`, `--min-enrichment-fold`, `--tip-window-bp`). Outputs: `ALL_INTER_TRA.tsv`, `ALL_INTER_TRA_pre_enrichment.tsv`, `ALL_INTER_TRA_enrichment_dropped.tsv`.
+
+
 ### `pipeline`
 
-Runs inversion and translocation in parallel, then writes both result tables (and a combined `ALL_SV.tsv`) into one shared `--outdir`. Prefer the two MAPQ-specific mcools from preprocess; a single shared mcool still works.
+Runs inversion and **intra**-chromosomal translocation in parallel, then writes both result tables (and a combined `ALL_SV.tsv`) into one shared `--outdir`. Prefer the two MAPQ-specific mcools from preprocess; a single shared mcool still works.
 
 ```bash
 ./phasc pipeline \
@@ -198,9 +225,9 @@ Runs inversion and translocation in parallel, then writes both result tables (an
 Useful options:
 
 - `--inv-mcool` / `--tra-mcool` — separate contact maps (recommended after preprocess)
-- `--chromosomes chr3B` — chromosome passed to translocation (first name only)
+- `--chromosomes chr3B` — chromosome passed to intra-translocation (first name only)
 - `--inv-min-support 2` — inversion multiscale support threshold
-- `--min-enrichment-fold 1.5` — forwarded to translocation final gate (default 1.5)
+- `--min-enrichment-fold 1.5` — forwarded to intra-translocation final gate (default 1.5)
 - `--truth truth.bed` — optional TRA truth BED for evaluation prints
 - `--tra-skip-plot` / `--no-tra-skip-plot` — control TRA community plots
 - `--keep-work` — retain `outdir/.pipeline_work` for debugging
@@ -211,6 +238,31 @@ Main outputs:
 - `ALL_TRA.tsv` / `merged_true_calls.tsv` — translocation calls (enrichment-gated)
 - `ALL_SV.tsv` — combined INV + TRA table
 - `HiC_images/` — inversion Hi-C panels
+
+
+### `correct`
+
+After INV/TRA detection, correct **contig mounting** mistakes (wrong orientation/order across scaffolding gaps). Splits the FASTA on N-runs, and only corrects a call when it covers ≥ `--cover-frac` of **every** overlapping contig (partial cuts are rejected).
+
+```bash
+./phasc correct \
+  -f genome.fa \
+  --inv PHASC_results/ALL_INV_multiscale.tsv \
+  --tra PHASC_results/ALL_TRA.tsv \
+  -o CORRECT_results \
+  --cover-frac 0.9
+```
+
+- **INV**: reverse the spanned contig/gap block and reverse-complement contig sequences
+- **TRA**: move the candidate contig block to immediately before the partner contig block
+- `--dry-run` — write `correction_decisions.tsv` only
+- `--min-gap-n` — minimum N-run length that splits contigs (default: 1)
+
+Outputs:
+
+- `corrected.fasta` — corrected genome
+- `correction_decisions.tsv` — per-call correct/skip with reasons
+- `contigs_from_N.bed` — N-split contigs
 
 
 ## License

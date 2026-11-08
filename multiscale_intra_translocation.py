@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Multi-resolution x multi-Louvain TRA detection (standalone).
+"""Multi-resolution x multi-Louvain *intra*-chromosomal TRA detection.
 
-One script, no other project imports. Default flow:
+Companion to ``multiscale_inter_translocation.py``. Default flow:
 
   for Hi-C resolution in {50,100,200,500} kb:
       for Louvain/PLM gamma in {0.5, 0.75, 1.0, 1.25, 1.5, 2.0}:

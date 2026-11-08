@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run inversion and translocation detection in parallel into one outdir.
+"""Run inversion and intra-chromosomal translocation detection in parallel.
 
 Both detectors write to private work directories first (TRA would otherwise
 wipe INV's HiC_images/), then final artifacts are promoted into --outdir.
@@ -67,7 +67,7 @@ def _promote_inversion(work: Path, outdir: Path) -> list[str]:
     return promoted
 
 
-def _promote_translocation(work: Path, outdir: Path) -> list[str]:
+def _promote_intra_translocation(work: Path, outdir: Path) -> list[str]:
     promoted: list[str] = []
     names = (
         "ALL_TRA.tsv",
@@ -218,9 +218,9 @@ def _first_chrom_from_mcool(mcool: Path) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run PHASC inversion and translocation detection in parallel "
-            "and write both results into the same --outdir. "
-            "Prefer separate preprocess mcools (INV MAPQ / TRA MAPQ); "
+            "Run PHASC inversion and intra-chromosomal translocation "
+            "detection in parallel and write both results into the same "
+            "--outdir. Prefer separate preprocess mcools (INV MAPQ / TRA MAPQ); "
             "a single positional mcool is still accepted for both."
         )
     )
@@ -238,7 +238,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tra-mcool",
         default=None,
-        help="translocation .mcool (e.g. preprocess *.tra.mapq1.mcool)",
+        help="intra-TRA .mcool (e.g. preprocess *.tra.mapq1.mcool)",
     )
     parser.add_argument(
         "-o",
@@ -278,14 +278,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--chromosomes",
         default=None,
         help=(
-            "chromosome for translocation (--chrom); if omitted, use the "
-            "first chromosome in the mcool. Only the first name is used."
+            "chromosome for intra-translocation (--chrom); if omitted, use "
+            "the first chromosome in the mcool. Only the first name is used."
         ),
     )
     parser.add_argument(
         "--truth",
         default=None,
-        help="optional TRA truth BED passed to translocation --truth",
+        help="optional TRA truth BED passed to intra-translocation --truth",
     )
     parser.add_argument(
         "--tra-skip-plot",
@@ -327,7 +327,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help=(
             "NetworKit threads for TRA PLM (default: 0 = auto cpu/2; "
-            "passed as translocation --threads)"
+            "passed as intra-translocation --threads)"
         ),
     )
     parser.add_argument(
@@ -368,7 +368,7 @@ def main(argv: list[str] | None = None) -> int:
 
     base_dir = Path(__file__).resolve().parent
     inv_script = base_dir / "multiscale_inversion.py"
-    tra_script = base_dir / "multiscale_translocation.py"
+    tra_script = base_dir / "multiscale_intra_translocation.py"
     for script in (inv_script, tra_script):
         if not script.is_file():
             raise SystemExit(f"[ERROR] missing script: {script}")
@@ -376,7 +376,7 @@ def main(argv: list[str] | None = None) -> int:
     outdir = Path(args.outdir).expanduser().resolve()
     work_root = outdir / ".pipeline_work"
     inv_work = work_root / "inversion"
-    tra_work = work_root / "translocation"
+    tra_work = work_root / "intra_translocation"
     if work_root.exists():
         shutil.rmtree(work_root)
     inv_work.mkdir(parents=True)
@@ -447,13 +447,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[INFO] TRA mcool={tra_mcool}", flush=True)
     if shared is not None and inv_mcool == tra_mcool == shared:
         print("[INFO] using shared mcool for both detectors", flush=True)
-    print("[INFO] running inversion + translocation in parallel", flush=True)
+    print("[INFO] running inversion + intra-translocation in parallel", flush=True)
 
     errors: list[tuple[str, BaseException]] = []
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = {
             executor.submit(_run_labeled, inv_cmd, "INV"): "inversion",
-            executor.submit(_run_labeled, tra_cmd, "TRA"): "translocation",
+            executor.submit(_run_labeled, tra_cmd, "INTRA_TRA"): "intra-translocation",
         }
         for future in as_completed(futures):
             label = futures[future]
@@ -474,7 +474,7 @@ def main(argv: list[str] | None = None) -> int:
 
     promoted = []
     promoted.extend(_promote_inversion(inv_work, outdir))
-    promoted.extend(_promote_translocation(tra_work, outdir))
+    promoted.extend(_promote_intra_translocation(tra_work, outdir))
 
     # Ensure ALL_TRA.tsv exists even if only merged_true_calls was written
     all_tra = outdir / "ALL_TRA.tsv"

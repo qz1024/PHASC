@@ -29,19 +29,25 @@ def print_help_message():
   \033[1mpreprocess\033[0m       Map Hi-C once (chromap -q 0), filter INV/TRA MAPQ, two mcools
                    for downstream PHASC detection                              (preprocess.py)
   \033[1minversion\033[0m        Detect multi-scale inversions from mcool data               (multiscale_inversion.py)
-  \033[1mtranslocation\033[0m    Detect intra-chromosomal translocations from mcool data     (multiscale_translocation.py)
+  \033[1mintra-translocation\033[0m Detect intra-chromosomal translocations from mcool data  (multiscale_intra_translocation.py)
+  \033[1minter-translocation\033[0m Detect inter-chromosomal translocations from mcool data  (multiscale_inter_translocation.py)
   \033[1mpipeline\033[0m         Run inversion + translocation in parallel into one outdir   (pipeline.py)
+  \033[1mcorrect\033[0m          Correct contig mounting errors from INV/TRA vs N-split      (correct_scaffold.py)
 
 \033[1;34mEXAMPLE:\033[0m
   phasc preprocess -r genome.fa -1 hic_R1.fq.gz -2 hic_R2.fq.gz \\
                   [ -o preprocess_out ] [ -p sample ] [ -t 16 ] \\
                   [ --inv-mapq 0 ] [ --tra-mapq 1 ]   # filter from MAPQ-0 pairs
 
-  phasc translocation --mcool preprocess_out/sample.tra.mapq1.mcool --outdir TRA_results --chrom chr3B
+  phasc intra-translocation --mcool preprocess_out/sample.tra.mapq1.mcool --outdir TRA_results --chrom chr3B
+  phasc inter-translocation --mcool preprocess_out/sample.tra.mapq1.mcool \\
+                           --outdir INTER_TRA_results --chrom-a chr1A --chrom-b chr1B
   phasc inversion preprocess_out/sample.inv.mapq0.mcool --outdir INV_results
   phasc pipeline --inv-mcool preprocess_out/sample.inv.mapq0.mcool \\
                  --tra-mcool preprocess_out/sample.tra.mapq1.mcool \\
                  -o PHASC_results --jobs 4 --chromosomes chr3B
+  phasc correct -f genome.fa --inv PHASC_results/ALL_INV_multiscale.tsv \\
+                --tra PHASC_results/ALL_TRA.tsv -o CORRECT_results --cover-frac 0.9
 
 \033[1;34mTIPS:\033[0m
   Use phasc <command> --help to show options for one command.
@@ -62,8 +68,21 @@ def main():
     mapping = {
         "preprocess": [sys.executable, os.path.join(base_dir, "preprocess.py")],
         "inversion": [sys.executable, os.path.join(base_dir, "multiscale_inversion.py")],
-        "translocation": [sys.executable, os.path.join(base_dir, "multiscale_translocation.py")],
+        "intra-translocation": [
+            sys.executable,
+            os.path.join(base_dir, "multiscale_intra_translocation.py"),
+        ],
+        # ponytail: alias for old command name
+        "translocation": [
+            sys.executable,
+            os.path.join(base_dir, "multiscale_intra_translocation.py"),
+        ],
+        "inter-translocation": [
+            sys.executable,
+            os.path.join(base_dir, "multiscale_inter_translocation.py"),
+        ],
         "pipeline": [sys.executable, os.path.join(base_dir, "pipeline.py")],
+        "correct": [sys.executable, os.path.join(base_dir, "correct_scaffold.py")],
     }
 
     if command not in mapping:
