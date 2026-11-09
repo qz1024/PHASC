@@ -6,9 +6,10 @@ channels:
 dependencies:
   - python>=3.9,<3.13
   - cooler>=0.9
+  - dask>=2024.8
   - h5py
   - numpy
-  - pandas
+  - pandas>=2.2,<2.4
   - scipy
   - matplotlib
   - networkx>=3.0
