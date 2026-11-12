@@ -3,6 +3,10 @@
 
 Both detectors write to private work directories first (TRA would otherwise
 wipe INV's HiC_images/), then final artifacts are promoted into --outdir.
+
+TRA runs one detector process per chromosome. Concurrent chromosome workers
+are controlled by --chrom-jobs (default: auto). Each worker still uses
+--jobs for resolution×gamma parallelism inside that chromosome.
 """
 from __future__ import annotations
 
@@ -68,6 +72,7 @@ def _promote_inversion(work: Path, outdir: Path) -> list[str]:
 
 
 def _promote_intra_translocation(work: Path, outdir: Path) -> list[str]:
+    """Promote a single-chromosome TRA workdir (legacy path)."""
     promoted: list[str] = []
     names = (
         "ALL_TRA.tsv",
@@ -92,9 +97,75 @@ def _promote_intra_translocation(work: Path, outdir: Path) -> list[str]:
 def _read_tsv(path: Path):
     import pandas as pd
 
-    if not path.is_file():
+    if not path.is_file() or path.stat().st_size == 0:
         return pd.DataFrame()
-    return pd.read_csv(path, sep="\t")
+    try:
+        return pd.read_csv(path, sep="\t")
+    except pd.errors.EmptyDataError:
+        # headerless / whitespace-only TRA stubs
+        return pd.DataFrame()
+
+
+def _merge_tsv_files(paths: list[Path], out: Path) -> bool:
+    import pandas as pd
+
+    frames = []
+    for path in paths:
+        df = _read_tsv(path)
+        if not df.empty:
+            frames.append(df)
+    if not frames:
+        return False
+    merged = pd.concat(frames, ignore_index=True, sort=False)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    merged.to_csv(out, sep="\t", index=False)
+    return True
+
+
+def _merge_tra_chromosome_results(
+    chrom_works: dict[str, Path], outdir: Path
+) -> list[str]:
+    """Move per-chrom TRA dirs under outdir/tra_by_chrom and merge top-level TSVs."""
+    promoted: list[str] = []
+    tra_by_chrom = outdir / "tra_by_chrom"
+    if tra_by_chrom.exists():
+        shutil.rmtree(tra_by_chrom)
+    tra_by_chrom.mkdir(parents=True, exist_ok=True)
+
+    table_names = (
+        "ALL_TRA.tsv",
+        "ALL_TRA_pre_enrichment.tsv",
+        "ALL_TRA_enrichment_dropped.tsv",
+        "merged_true_calls.tsv",
+        "ALL_TRA_per_scale_candidates.tsv",
+        "per_resolution_summary.tsv",
+        "mutual_dropped_all.tsv",
+        "mutual_pairs_all.tsv",
+    )
+
+    for chrom, work in chrom_works.items():
+        dest = tra_by_chrom / chrom
+        if work.exists():
+            _promote(work, dest)
+            promoted.append(f"tra_by_chrom/{chrom}")
+
+    for name in table_names:
+        paths = [
+            tra_by_chrom / chrom / name
+            for chrom in chrom_works
+            if (tra_by_chrom / chrom / name).is_file()
+        ]
+        if _merge_tsv_files(paths, outdir / name):
+            promoted.append(name)
+
+    # Prefer ALL_TRA.tsv; fall back to merged_true_calls if needed
+    all_tra = outdir / "ALL_TRA.tsv"
+    merged_true = outdir / "merged_true_calls.tsv"
+    if not all_tra.exists() and merged_true.exists():
+        shutil.copy2(merged_true, all_tra)
+        promoted.append("ALL_TRA.tsv")
+
+    return promoted
 
 
 def _merge_sv_tables(outdir: Path) -> Path | None:
@@ -202,17 +273,74 @@ def _merge_sv_tables(outdir: Path) -> Path | None:
     return out
 
 
-def _first_chrom_from_mcool(mcool: Path) -> str:
+def _chroms_from_mcool(mcool: Path) -> list[str]:
     import cooler
 
     store = cooler.fileops.list_coolers(str(mcool))
     if not store:
         raise SystemExit(f"[ERROR] no cooler resolutions in {mcool}")
     uri = store[0] if store[0].startswith(str(mcool)) else f"{mcool}::{store[0]}"
-    chroms = list(cooler.Cooler(uri).chromnames)
+    chroms = [str(c) for c in cooler.Cooler(uri).chromnames]
     if not chroms:
         raise SystemExit(f"[ERROR] no chromosomes in {mcool}")
-    return str(chroms[0])
+    return chroms
+
+
+def _resolve_chromosomes(args: argparse.Namespace, tra_mcool: Path) -> list[str]:
+    available = _chroms_from_mcool(tra_mcool)
+    if args.chromosomes:
+        wanted = [c.strip() for c in str(args.chromosomes).split(",") if c.strip()]
+        if not wanted:
+            raise SystemExit("[ERROR] --chromosomes is empty")
+        missing = [c for c in wanted if c not in available]
+        if missing:
+            raise SystemExit(
+                f"[ERROR] chromosomes not in mcool: {', '.join(missing)}"
+            )
+        return wanted
+    # default: all chromosomes in the TRA mcool
+    return available
+
+
+def _build_tra_cmd(
+    *,
+    tra_script: Path,
+    tra_mcool: Path,
+    outdir: Path,
+    chrom: str,
+    jobs: int,
+    args: argparse.Namespace,
+) -> list[str]:
+    cmd = [
+        sys.executable,
+        str(tra_script),
+        "--mcool",
+        str(tra_mcool),
+        "--outdir",
+        str(outdir),
+        "--chrom",
+        chrom,
+        "--jobs",
+        str(jobs),
+        "--min-enrichment-fold",
+        str(args.min_enrichment_fold),
+        "--tip-window-bp",
+        str(args.tip_window_bp),
+    ]
+    if args.tra_skip_plot:
+        cmd.append("--skip-plot")
+    if args.truth:
+        cmd.extend(["--truth", str(Path(args.truth).expanduser().resolve())])
+    if args.tra_resolutions:
+        cmd.extend(["--resolutions", args.tra_resolutions])
+    if args.tra_gammas:
+        cmd.extend(["--gammas", args.tra_gammas])
+    # when many chromosomes run at once, auto threads (0) oversubscribe; clamp
+    tra_threads = int(args.tra_threads)
+    if tra_threads == 0 and int(args.chrom_jobs_effective) > 1:
+        tra_threads = 1
+    cmd.extend(["--threads", str(tra_threads)])
+    return cmd
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -221,7 +349,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Run PHASC inversion and intra-chromosomal translocation "
             "detection in parallel and write both results into the same "
             "--outdir. Prefer separate preprocess mcools (INV MAPQ / TRA MAPQ); "
-            "a single positional mcool is still accepted for both."
+            "a single positional mcool is still accepted for both. "
+            "TRA defaults to all chromosomes in the mcool, run concurrently."
         )
     )
     parser.add_argument(
@@ -250,7 +379,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--jobs",
         type=int,
         default=min(4, os.cpu_count() or 1),
-        help="passed to both detectors as --jobs (default: min(4, CPUs))",
+        help=(
+            "worker processes for INV and for each TRA chromosome's "
+            "resolution×gamma pool (default: min(4, CPUs)). When multiple "
+            "chromosomes run, each chromosome gets max(1, --jobs // --chrom-jobs)."
+        ),
+    )
+    parser.add_argument(
+        "--chrom-jobs",
+        type=int,
+        default=21,
+        help=(
+            "concurrent TRA chromosome workers (default: 21). "
+            "Set 0 for auto min(n_chroms, max(1, CPUs//2)); 1 for serial."
+        ),
     )
     parser.add_argument(
         "--balance",
@@ -278,8 +420,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--chromosomes",
         default=None,
         help=(
-            "chromosome for intra-translocation (--chrom); if omitted, use "
-            "the first chromosome in the mcool. Only the first name is used."
+            "comma-separated chromosomes for INV and intra-TRA "
+            "(default: all chromosomes in the TRA mcool). "
+            "Example: chr1A,chr1B,chr3B"
         ),
     )
     parser.add_argument(
@@ -326,8 +469,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help=(
-            "NetworKit threads for TRA PLM (default: 0 = auto cpu/2; "
-            "passed as intra-translocation --threads)"
+            "NetworKit threads for TRA PLM (default: 0 = auto; forced to 1 "
+            "when chrom-jobs > 1 to avoid oversubscription)"
         ),
     )
     parser.add_argument(
@@ -344,6 +487,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.jobs < 1:
         parser.error("--jobs must be >= 1")
+    if args.chrom_jobs < 0:
+        parser.error("--chrom-jobs must be >= 0")
     if args.inv_min_support < 1:
         parser.error("--inv-min-support must be >= 1")
 
@@ -376,17 +521,22 @@ def main(argv: list[str] | None = None) -> int:
     outdir = Path(args.outdir).expanduser().resolve()
     work_root = outdir / ".pipeline_work"
     inv_work = work_root / "inversion"
-    tra_work = work_root / "intra_translocation"
+    tra_root = work_root / "intra_translocation"
     if work_root.exists():
         shutil.rmtree(work_root)
     inv_work.mkdir(parents=True)
-    tra_work.mkdir(parents=True)
+    tra_root.mkdir(parents=True)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    if args.chromosomes:
-        chrom = args.chromosomes.split(",")[0].strip()
+    chroms = _resolve_chromosomes(args, tra_mcool)
+    n_chroms = len(chroms)
+    cpu = os.cpu_count() or 4
+    if args.chrom_jobs == 0:
+        chrom_jobs = min(n_chroms, max(1, cpu // 2))
     else:
-        chrom = _first_chrom_from_mcool(tra_mcool if tra_mcool else inv_mcool)
+        chrom_jobs = max(1, min(args.chrom_jobs, n_chroms))
+    args.chrom_jobs_effective = chrom_jobs
+    jobs_per_chrom = max(1, int(args.jobs) // chrom_jobs) if chrom_jobs > 1 else int(args.jobs)
 
     balance_flag = "--balance" if args.balance else "--no-balance"
 
@@ -402,6 +552,8 @@ def main(argv: list[str] | None = None) -> int:
         "--min-support",
         str(args.inv_min_support),
     ]
+    if args.chromosomes:
+        inv_cmd.extend(["--chromosomes", str(args.chromosomes)])
     if args.fasta:
         inv_cmd.extend(["--fasta", str(Path(args.fasta).expanduser().resolve())])
     if args.hic_alignments:
@@ -412,49 +564,57 @@ def main(argv: list[str] | None = None) -> int:
             ]
         )
 
-    tra_cmd = [
-        sys.executable,
-        str(tra_script),
-        "--mcool",
-        str(tra_mcool),
-        "--outdir",
-        str(tra_work),
-        "--chrom",
-        chrom,
-        "--jobs",
-        str(args.jobs),
-        "--min-enrichment-fold",
-        str(args.min_enrichment_fold),
-        "--tip-window-bp",
-        str(args.tip_window_bp),
-    ]
-    if args.tra_skip_plot:
-        tra_cmd.append("--skip-plot")
-    if args.truth:
-        tra_cmd.extend(["--truth", str(Path(args.truth).expanduser().resolve())])
-    if args.tra_resolutions:
-        tra_cmd.extend(["--resolutions", args.tra_resolutions])
-    if args.tra_gammas:
-        tra_cmd.extend(["--gammas", args.tra_gammas])
-    tra_cmd.extend(["--threads", str(args.tra_threads)])
+    chrom_works: dict[str, Path] = {}
+    tra_cmds: dict[str, list[str]] = {}
+    for chrom in chroms:
+        safe = chrom.replace("/", "_")
+        chrom_work = tra_root / safe
+        chrom_work.mkdir(parents=True, exist_ok=True)
+        chrom_works[chrom] = chrom_work
+        tra_cmds[chrom] = _build_tra_cmd(
+            tra_script=tra_script,
+            tra_mcool=tra_mcool,
+            outdir=chrom_work,
+            chrom=chrom,
+            jobs=jobs_per_chrom,
+            args=args,
+        )
 
     print(
         f"[INFO] pipeline outdir={outdir} jobs={args.jobs} "
-        f"balance={bool(args.balance)} chrom={chrom}",
+        f"balance={bool(args.balance)}",
+        flush=True,
+    )
+    print(
+        f"[INFO] INV+TRA chromosomes ({n_chroms}): {', '.join(chroms)}",
+        flush=True,
+    )
+    print(
+        f"[INFO] TRA chrom-jobs={chrom_jobs} jobs/chrom={jobs_per_chrom}",
         flush=True,
     )
     print(f"[INFO] INV mcool={inv_mcool}", flush=True)
     print(f"[INFO] TRA mcool={tra_mcool}", flush=True)
     if shared is not None and inv_mcool == tra_mcool == shared:
         print("[INFO] using shared mcool for both detectors", flush=True)
-    print("[INFO] running inversion + intra-translocation in parallel", flush=True)
+    print(
+        "[INFO] running inversion + per-chromosome intra-TRA "
+        f"(max {chrom_jobs} chrom workers)",
+        flush=True,
+    )
 
+    # INV + up to chrom_jobs TRA workers at once
+    max_workers = 1 + chrom_jobs
     errors: list[tuple[str, BaseException]] = []
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(_run_labeled, inv_cmd, "INV"): "inversion",
-            executor.submit(_run_labeled, tra_cmd, "INTRA_TRA"): "intra-translocation",
         }
+        for chrom, cmd in tra_cmds.items():
+            futures[
+                executor.submit(_run_labeled, cmd, f"TRA:{chrom}")
+            ] = f"intra-translocation:{chrom}"
+
         for future in as_completed(futures):
             label = futures[future]
             try:
@@ -472,16 +632,18 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 1
 
-    promoted = []
+    promoted: list[str] = []
     promoted.extend(_promote_inversion(inv_work, outdir))
-    promoted.extend(_promote_intra_translocation(tra_work, outdir))
-
-    # Ensure ALL_TRA.tsv exists even if only merged_true_calls was written
-    all_tra = outdir / "ALL_TRA.tsv"
-    merged_true = outdir / "merged_true_calls.tsv"
-    if not all_tra.exists() and merged_true.exists():
-        shutil.copy2(merged_true, all_tra)
-        promoted.append("ALL_TRA.tsv")
+    if n_chroms == 1:
+        only = next(iter(chrom_works.values()))
+        promoted.extend(_promote_intra_translocation(only, outdir))
+        all_tra = outdir / "ALL_TRA.tsv"
+        merged_true = outdir / "merged_true_calls.tsv"
+        if not all_tra.exists() and merged_true.exists():
+            shutil.copy2(merged_true, all_tra)
+            promoted.append("ALL_TRA.tsv")
+    else:
+        promoted.extend(_merge_tra_chromosome_results(chrom_works, outdir))
 
     combined = _merge_sv_tables(outdir)
     if combined is not None:

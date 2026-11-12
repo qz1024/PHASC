@@ -367,11 +367,20 @@ def parse_args():
         type=float,
         default=0.0,
         help=(
-            "min (continuity_after_flip - continuity_before) to accept an INV. "
-            "Flip S in the contact matrix; continuity = Spearman(contact, "
-            "-dist_to_junction) on L×S / S×R. Positive delta ⇒ flip made "
-            "junctions more continuous ⇒ assembly had S inverted. "
-            "Default 0.0; set < -1e8 to disable."
+            "post-merge only: per-resolution flipΔ must be > this to count "
+            "(default: 0.0 ⇒ strictly > 0). Flip is not gated per-resolution "
+            "during detection. Set < -1e8 to disable the post-merge flip gate."
+        )
+    )
+
+
+    parser.add_argument(
+        "--flip_min_pos_scales",
+        type=int,
+        default=2,
+        help=(
+            "post-merge: require this many resolutions with flipΔ > "
+            "--flip_improve_min (default: 2). Flanks are |S| on each side."
         )
     )
 
@@ -416,7 +425,7 @@ def parse_args():
         default=2.0,
         help=(
             "min S×S anti/bg for internal INV when |S| <= --small_inv_max_size "
-            "(default: 2.0; <=0 off). Tip oneside is exempt."
+            "(default: 2.0; <=0 off). Tip oneside uses --tip_anti_diag_min."
         )
     )
 
@@ -426,8 +435,8 @@ def parse_args():
         type=float,
         default=0.2,
         help=(
-            "min flip continuity delta when |S| <= --small_inv_max_size "
-            "(default: 0.2; overrides --flip_improve_min for small calls)"
+            "legacy no-op (flip is post-merge with flank=|S|; "
+            "kept for CLI compatibility)"
         )
     )
 
@@ -455,46 +464,13 @@ def parse_args():
 
 
     parser.add_argument(
-        "--tip_anti_diag_rescue",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "grow chrom-tip Louvain tiles by S×S anti/background ratio to "
-            "rescue Juicebox tip bowties that flank-GCOR misses "
-            "(default: off)"
-        )
-    )
-
-
-    parser.add_argument(
         "--tip_anti_diag_min",
         type=float,
         default=3.0,
-        help="min S×S anti/background ratio for tip bowtie rescue (default: 3)"
-    )
-
-
-    parser.add_argument(
-        "--tip_anti_diag_min_size",
-        type=int,
-        default=3_000_000,
-        help="min tip bowtie size for anti-diag rescue (default: 3000000)"
-    )
-
-
-    parser.add_argument(
-        "--tip_anti_diag_max_size",
-        type=int,
-        default=30_000_000,
-        help="max tip bowtie size for anti-diag rescue (default: 30000000)"
-    )
-
-
-    parser.add_argument(
-        "--tip_anti_diag_max_tiles",
-        type=int,
-        default=12,
-        help="max Louvain tip tiles to merge for anti-diag rescue (default: 12)"
+        help=(
+            "chrom-tip oneside: require S×S anti/background >= this "
+            "(Juicebox tip X / bowtie; default: 3; <=0 disables)"
+        )
     )
 
 
@@ -510,6 +486,28 @@ def parse_args():
             "If small/large >= threshold, do NOT treat the large community as "
             "tip (outermost small stays tip when present; outer large is "
             "demoted). Default: 0.25; <=0 disables (always outermost only)"
+        )
+    )
+
+
+    parser.add_argument(
+        "--tip_telomere_trim_bp",
+        type=int,
+        default=200_000,
+        help=(
+            "for chrom-tip inversions, drop this many bp from the telomere "
+            "edge of S when scoring GCOR and flip (default: 200000). Call "
+            "coordinates still include the tip. <=0 disables."
+        )
+    )
+
+
+    parser.add_argument(
+        "--chromosomes",
+        default=None,
+        help=(
+            "comma-separated chromosomes to run (default: all in mcool). "
+            "Example: chr1A,chr1B,chr3B"
         )
     )
 
@@ -856,6 +854,11 @@ def parse_args():
     if args.min_scale_support<1:
 
         parser.error("--min_scale_support must be >= 1")
+
+
+    if int(getattr(args,"flip_min_pos_scales",2))<1:
+
+        parser.error("--flip_min_pos_scales must be >= 1")
 
 
     if args.within_scale_samples<1:
@@ -1703,6 +1706,7 @@ def _edge_oneside_guard_selfcheck():
         flip_improve_min=0.0
         gcor_low_signal_frac=0.0
         gcor_strong_arm_min=0.0
+        tip_anti_diag_min=0.0  # off: synthetic tip has no Juicebox X
     args=_A()
     blocks=[[0, 500_000, 0], [500_000, 1_000_000, 1], [1_000_000, 1_500_000, 2]]
     hic=np.eye(30, dtype=float)
@@ -2969,6 +2973,225 @@ def flip_improvement_score(
     return float(after - before), float(before), float(after)
 
 
+def inversion_flank_spans(start, end, chrom_size):
+    """
+    Genomic flanks of length exactly |S| abutting the call.
+
+    left  = [S.start - |S|, S.start] if it fits on-chrom, else None
+    right = [S.end, S.end + |S|] if it fits on-chrom, else None
+    Tip / near-end calls may keep only the inward flank.
+    """
+    s0 = int(start)
+    s1 = int(end)
+    size = s1 - s0
+    chrom_size = int(chrom_size)
+    if size < 1 or chrom_size < 1:
+        return None, None
+    left = [s0 - size, s0, 0] if s0 >= size else None
+    right = [s1, s1 + size, 0] if (s1 + size) <= chrom_size else None
+    return left, right
+
+
+def tip_telomere_trim_span(
+    start,
+    end,
+    chrom_size=None,
+    tip_trim_bp=200_000,
+    edge_oneside=None,
+):
+    """
+    Drop tip_trim_bp from the telomere edge of a chrom-tip INV for GCOR /
+    flip scoring only. Reported call coordinates stay untrimmed.
+
+    5' tip: start==0 (or edge_oneside=\"right\" with start at 0).
+    3' tip: end>=chrom_size (needs chrom_size).
+    If trim would leave |S| < tip_trim_bp, return the original span.
+    """
+    s0, s1 = int(start), int(end)
+    trim = int(tip_trim_bp or 0)
+    if trim <= 0 or s1 <= s0:
+        return s0, s1
+    if edge_oneside == "right":
+        at_5, at_3 = (s0 <= 0), False
+    elif edge_oneside == "left":
+        at_5 = False
+        at_3 = chrom_size is not None and s1 >= int(chrom_size)
+    else:
+        at_5 = s0 <= 0
+        at_3 = chrom_size is not None and s1 >= int(chrom_size)
+    if not at_5 and not at_3:
+        return s0, s1
+    out0, out1 = s0, s1
+    if at_5:
+        out0 = s0 + trim
+    if at_3:
+        out1 = s1 - trim
+    # ponytail: refuse trim when remaining S is shorter than the trim itself
+    if out1 - out0 < trim:
+        return s0, s1
+    return out0, out1
+
+
+def flip_improvement_for_interval(
+    clr, chrom, start, end, balance=False, tip_trim_bp=200_000
+):
+    """
+    flipΔ for one cooler resolution with flanks of length |S|.
+
+    Fetches only left|S|right (not the whole chrom).
+    Chrom-tip calls score on a telomere-trimmed S (default drop 0.2 Mb);
+    call coordinates themselves are unchanged by the caller.
+    """
+    res = int(getattr(clr, "binsize", None) or clr.info.get("bin-size"))
+    chrom_size = int(clr.chromsizes[chrom])
+    s0, s1 = tip_telomere_trim_span(
+        start, end, chrom_size=chrom_size, tip_trim_bp=tip_trim_bp
+    )
+    left, right = inversion_flank_spans(s0, s1, chrom_size)
+    if left is None and right is None:
+        return float("nan"), float("nan"), float("nan")
+    w0 = int(left[0]) if left is not None else s0
+    w1 = int(right[1]) if right is not None else s1
+    if w1 - w0 < 2 * res:
+        return float("nan"), float("nan"), float("nan")
+    mat = np.asarray(
+        clr.matrix(balance=bool(balance)).fetch((chrom, w0, w1)),
+        dtype=float,
+    )
+    mat = np.nan_to_num(mat, nan=0.0)
+
+    def _rel(span):
+        if span is None:
+            return None
+        return [int(span[0]) - w0, int(span[1]) - w0, 0]
+
+    return flip_improvement_score(
+        mat,
+        _rel(left),
+        [s0 - w0, s1 - w0, 0],
+        _rel(right),
+        res,
+    )
+
+
+def evaluate_multires_flip(
+    mcool_file,
+    chrom,
+    start,
+    end,
+    resolutions,
+    flip_min=0.0,
+    balance=False,
+    tip_trim_bp=200_000,
+):
+    """
+    Per-resolution flipΔ with flank=|S|.
+
+    Returns (n_positive, mean_delta, {res: delta}).
+    A scale counts positive when delta is finite and delta > flip_min
+    (default flip_min=0 ⇒ strictly greater than 0).
+    """
+    per = {}
+    plot_mcool = resolve_plot_mcool(mcool_file)
+    for res in resolutions:
+        res = int(res)
+        try:
+            clr = cooler.Cooler(f"{plot_mcool}::resolutions/{res}")
+            d, _, _ = flip_improvement_for_interval(
+                clr,
+                chrom,
+                start,
+                end,
+                balance=balance,
+                tip_trim_bp=tip_trim_bp,
+            )
+        except Exception:
+            d = float("nan")
+        per[res] = float(d) if np.isfinite(d) else float("nan")
+    n_pos = sum(
+        1
+        for d in per.values()
+        if np.isfinite(d) and float(d) > float(flip_min)
+    )
+    finite = [float(d) for d in per.values() if np.isfinite(d)]
+    mean_d = float(np.mean(finite)) if finite else float("nan")
+    return int(n_pos), mean_d, per
+
+
+def apply_post_merge_flip_gate(
+    mcool_file,
+    calls,
+    resolutions,
+    flip_min=0.0,
+    min_pos_scales=2,
+    balance=False,
+    tip_trim_bp=200_000,
+):
+    """
+    After merge: recompute flipΔ at each resolution (flank=|S|) and keep
+    calls with >= min_pos_scales resolutions where flipΔ > flip_min.
+    """
+    if calls is None or getattr(calls, "empty", True):
+        return calls
+    if float(flip_min) <= -1e8:
+        out = calls.copy()
+        out["flip_pos_scales"] = np.nan
+        out["flip_pass"] = 1
+        return out
+    res_list = [int(r) for r in resolutions]
+    rows = []
+    n_drop = 0
+    for _, call in calls.iterrows():
+        chrom = str(call["chrom"])
+        s0 = int(call["start"])
+        s1 = int(call["end"])
+        n_pos, mean_d, per = evaluate_multires_flip(
+            mcool_file,
+            chrom,
+            s0,
+            s1,
+            res_list,
+            flip_min=flip_min,
+            balance=balance,
+            tip_trim_bp=tip_trim_bp,
+        )
+        rec = call.to_dict()
+        rec["flip_improve"] = mean_d if np.isfinite(mean_d) else np.nan
+        rec["flip_pos_scales"] = int(n_pos)
+        rec["flip_by_resolution"] = ",".join(
+            (
+                "{}:{:+.4f}".format(r, per[r])
+                if np.isfinite(per[r])
+                else "{}:NA".format(r)
+            )
+            for r in sorted(per)
+        )
+        rec["flip_pass"] = int(n_pos >= int(min_pos_scales))
+        if rec["flip_pass"] == 1:
+            rows.append(rec)
+        else:
+            n_drop += 1
+            print(
+                f"[INFO] post-merge flip drop {chrom}:{s0}-{s1} "
+                f"(pos_scales={n_pos}/{len(res_list)} "
+                f"need>={min_pos_scales}; {rec['flip_by_resolution']})",
+                flush=True,
+            )
+    out = pd.DataFrame(rows) if rows else calls.iloc[0:0].copy()
+    for col in ("flip_improve", "flip_pos_scales", "flip_pass", "flip_by_resolution"):
+        if col not in out.columns:
+            out[col] = np.nan if col == "flip_improve" else (
+                "" if col == "flip_by_resolution" else 0
+            )
+    print(
+        f"[INFO] post-merge flip gate: kept {len(out)} / "
+        f"{len(calls)} (dropped {n_drop}; "
+        f"need >={min_pos_scales} scales with flipΔ > {flip_min})",
+        flush=True,
+    )
+    return out.reset_index(drop=True)
+
+
 def _flip_improvement_selfcheck():
     # Continuous chromosome: flip middle → decay at junctions gets worse.
     n = 60
@@ -2984,6 +3207,33 @@ def _flip_improvement_selfcheck():
         inv, left, target, right, 1, band=2
     )
     assert d_inv > 0, (d_inv, b_inv, a_inv)
+    # Flank length must equal |S| when both sides fit.
+    L, R = inversion_flank_spans(100, 150, 1000)
+    assert L == [50, 100, 0] and R == [150, 200, 0], (L, R)
+    L2, R2 = inversion_flank_spans(0, 50, 1000)
+    assert L2 is None and R2 == [50, 100, 0], (L2, R2)
+    # Gate: need two scales with flipΔ > 0.
+    assert sum(1 for d in (0.1, 0.2, -0.1) if d > 0) >= 2
+    assert sum(1 for d in (0.1, -0.2, -0.1) if d > 0) < 2
+    # Tip telomere trim: score span shrinks; call coords stay caller's job.
+    cs = 100_000_000
+    assert tip_telomere_trim_span(
+        0, 3_000_000, chrom_size=cs, tip_trim_bp=200_000
+    ) == (200_000, 3_000_000)
+    assert tip_telomere_trim_span(
+        10_000_000, 13_000_000, chrom_size=cs, tip_trim_bp=200_000
+    ) == (10_000_000, 13_000_000)
+    assert tip_telomere_trim_span(
+        cs - 3_000_000, cs, chrom_size=cs, tip_trim_bp=200_000
+    ) == (cs - 3_000_000, cs - 200_000)
+    # Too short after trim → keep original.
+    assert tip_telomere_trim_span(
+        0, 300_000, chrom_size=cs, tip_trim_bp=200_000
+    ) == (0, 300_000)
+    # edge_oneside without genomic tip → no trim.
+    assert tip_telomere_trim_span(
+        500_000, 1_000_000, edge_oneside="left", tip_trim_bp=200_000
+    ) == (500_000, 1_000_000)
 
 
 def s_matrix_gap_frac(mat, bright_factor=0.35, floor=0.08):
@@ -3191,7 +3441,21 @@ def detect_block_INV(
         return None
 
 
-    target_size=target[1]-target[0]
+    # Tip GCOR: drop telomere tip_trim_bp from the outer edge of S; call
+    # coords (returned start/end) stay full. Flank abutment still uses the
+    # untrimmed INV junction.
+    chrom_size_bp=int(hic.shape[0])*int(args.res)
+    score_s0,score_s1=tip_telomere_trim_span(
+        target[0],
+        target[1],
+        chrom_size=chrom_size_bp,
+        tip_trim_bp=int(getattr(args,"tip_telomere_trim_bp",200_000)),
+        edge_oneside=edge_oneside,
+    )
+    gcor_target=[score_s0,score_s1,target[2] if len(target)>2 else 0]
+
+    target_size=int(gcor_target[1])-int(gcor_target[0])
+    call_size=int(target[1])-int(target[0])
     rho_cut=effective_rho_cutoff(args, target_size)
     fractions=list(args.neighbor_scale_fractions)
     min_support=int(args.neighbor_scale_min_support)
@@ -3279,11 +3543,12 @@ def detect_block_INV(
 
         # Drop GAP bins inside Left×S / S×Right so white bands do not
         # flatten Spearman orientation (same mask as Louvain clustering).
+        # Tip scoring uses gcor_target (telomere-trimmed S).
         left_matrix=None
         right_matrix=None
         if need_left:
             left_parts=[
-                get_block_matrix(hic, block, target, args.res, gap_mask)
+                get_block_matrix(hic, block, gcor_target, args.res, gap_mask)
                 for block in left_blocks
             ]
             left_parts=[p for p in left_parts if p.size]
@@ -3298,7 +3563,7 @@ def detect_block_INV(
             left_matrix=np.vstack(left_parts)
         if need_right:
             right_parts=[
-                get_block_matrix(hic, target, block, args.res, gap_mask)
+                get_block_matrix(hic, gcor_target, block, args.res, gap_mask)
                 for block in right_blocks
             ]
             right_parts=[p for p in right_parts if p.size]
@@ -3571,7 +3836,7 @@ def detect_block_INV(
     if (
         edge_oneside is not None
         and large_min>0
-        and int(target_size)>=large_min
+        and int(call_size)>=large_min
     ):
         if occ_min>0:
             occ_min=min(
@@ -3600,13 +3865,16 @@ def detect_block_INV(
     if gap_max>=0 and np.isfinite(s_gap_frac):
         signal_pass=int(signal_pass and s_gap_frac<=gap_max)
 
-    # Size-dependent tightening for short calls.
+    # Size-dependent tightening for short calls (full call length, not trim).
     small_max=int(getattr(args, "small_inv_max_size", 1_000_000))
-    is_small=small_max>0 and int(target_size)<=small_max
-    # Global anti-diag gate removed; keep it for small *internal* calls
-    # (INV208-like: noisy flank GCOR, no bowtie). Tip oneside exempt.
+    is_small=small_max>0 and int(call_size)<=small_max
+    # Anti-diag gate:
+    #   tip oneside — require S×S anti/bg (Juicebox X); default tip_anti_diag_min=3
+    #   small internal — small_s_anti_diag_min (noisy short calls)
     anti_min=0.0
-    if is_small and edge_oneside is None:
+    if edge_oneside is not None:
+        anti_min=float(getattr(args, "tip_anti_diag_min", 3.0))
+    elif is_small:
         anti_min=float(getattr(args, "small_s_anti_diag_min", 2.0))
     band=int(getattr(args, "corner_band_bins", 2))
     s_anti_ratio,s_anti_mean,s_diag_mean=s_matrix_anti_diag_bg_ratio(
@@ -3753,16 +4021,8 @@ def detect_block_INV(
             >= strong_arm_min
         )
 
-    # Flip-S only if every cheaper gate already passes. Local window only
-    # (see flip_improvement_score) — never copy the whole chrom matrix.
-    # Small internal calls use a stricter flip floor (noise GCOR FPs).
-    # Default flip_improve_min=0 ⇒ require flipΔ >= 0.
-    flip_min=float(getattr(args, "flip_improve_min", 0.0))
-    if is_small:
-        flip_min=max(
-            flip_min,
-            float(getattr(args, "small_flip_improve_min", 0.2)),
-        )
+    # Flip is post-merge only (flank=|S|, multi-resolution vote). Do not
+    # score or gate flipΔ at single-resolution detection.
     flip_delta=float("nan")
     flip_before=float("nan")
     flip_after=float("nan")
@@ -3772,21 +4032,7 @@ def detect_block_INV(
         and lattice_pass==1 and parallel_pass==1 and fill_pass==1
         and signal_pass==1 and anti_pass==1
     )
-    if flip_min > -1e8 and other_ok==1:
-        left_span=(
-            [left_start, left_end, 0]
-            if need_left and left_end>left_start else None
-        )
-        right_span=(
-            [right_start, right_end, 0]
-            if need_right and right_end>right_start else None
-        )
-        flip_delta,flip_before,flip_after=flip_improvement_score(
-            hic, left_span, target, right_span, args.res, band=band
-        )
-        if not np.isfinite(flip_delta) or float(flip_delta)<flip_min:
-            flip_pass=0
-    inv=int(other_ok==1 and flip_pass==1)
+    inv=int(other_ok==1)
 
     def _avg_field(name):
         vals=[
@@ -3799,7 +4045,7 @@ def detect_block_INV(
     return {
         "start":target[0],
         "end":target[1],
-        "size":target_size,
+        "size":call_size,
         "left_start":left_start,
         "left_end":left_end,
         "right_start":right_start,
@@ -3953,203 +4199,6 @@ def _resolve_tip_oneside_selfcheck():
     assert resolve_tip_oneside_index(blocks6, "end", 0.25) == 2
 
 
-def _tip_anti_diag_grow_rescue(
-    hic, blocks, args, chrom, results, chrom_length_bp=None
-):
-    """
-    Rescue large chrom-tip bowties that flank-GCOR misses.
-
-    Observed failure mode (Tpo chr69 / GWHJWDK00000069.1 ~0-12 Mb):
-      - Juicebox shows a clear tip X / anti-diagonal square
-      - Louvain shatters the tip into ~2 Mb tiles
-      - tip oneside GCOR only passes on the tiny first tile; merging to the
-        full bowtie flips right_rho to the wrong sign and corner fails
-      - S×S anti/background ratio is high for the true ~0-10 Mb span
-
-    Grow by merging the first (or last) k Louvain tiles and keep the span
-    with the strongest anti/bg ratio above --tip_anti_diag_min.
-
-    chrom_length_bp:
-        True chromosome length. Required when `hic` is a sub-window (diagnose);
-        otherwise window ends are mistaken for chrom 3' tips.
-    """
-    if not bool(getattr(args, "tip_anti_diag_rescue", False)):
-        return
-    # Tip anti-diag writes ρL=ρR=0; incompatible with strong-arm GCOR gate.
-    if float(getattr(args, "gcor_strong_arm_min", 0.5)) > 0:
-        return
-    if len(blocks) < 2:
-        return
-    thr = float(getattr(args, "tip_anti_diag_min", 3.0))
-    if thr <= 0:
-        return
-    min_size = int(getattr(args, "tip_anti_diag_min_size", 3_000_000))
-    max_size = int(getattr(args, "tip_anti_diag_max_size", 30_000_000))
-    max_tiles = int(getattr(args, "tip_anti_diag_max_tiles", 12))
-    band = int(getattr(args, "corner_band_bins", 2))
-
-    def _already_called(start, end):
-        """True if a same-size or larger INV already covers this tip span."""
-        new_size = max(1, end - start)
-        for rec in results:
-            if rec.get("INV") != 1:
-                continue
-            a0, a1 = int(rec.get("start", 0)), int(rec.get("end", 0))
-            if a0 == start and a1 == end:
-                return True
-            ov = max(0, min(a1, end) - max(a0, start))
-            # Only treat as redundant when an existing call covers most of
-            # this (usually larger) tip span. A tiny 2 Mb tip hit must not
-            # suppress a 10 Mb anti-diag rescue that contains it.
-            if ov / new_size >= 0.5 and (a1 - a0) >= new_size * 0.8:
-                return True
-        return False
-
-    def _drop_nested_smaller_tips(start, end):
-        keep = []
-        for rec in results:
-            if rec.get("INV") != 1:
-                keep.append(rec)
-                continue
-            a0, a1 = int(rec.get("start", 0)), int(rec.get("end", 0))
-            if a0 >= start and a1 <= end and (a1 - a0) < (end - start) * 0.8:
-                continue
-            keep.append(rec)
-        results[:] = keep
-
-    def _scan(edge_oneside):
-        best = None
-        n = min(len(blocks), max_tiles)
-        for k in range(1, n + 1):  # merge first/last 1..n Louvain tiles
-            if edge_oneside == "right":
-                start, end = int(blocks[0][0]), int(blocks[k - 1][1])
-            else:
-                start, end = int(blocks[-k][0]), int(blocks[-1][1])
-            size = end - start
-            if size < min_size or size > max_size:
-                continue
-            s_mat = get_block_matrix(
-                hic, [start, end, 0], [start, end, 0], args.res, None
-            )
-            ratio, anti_m, diag_m = s_matrix_anti_diag_bg_ratio(
-                s_mat, band=band
-            )
-            if not np.isfinite(ratio) or ratio < thr:
-                continue
-            cand = {
-                "k": k,
-                "start": start,
-                "end": end,
-                "size": size,
-                "ratio": float(ratio),
-                "anti": float(anti_m),
-                "diag": float(diag_m),
-                "edge_oneside": edge_oneside,
-            }
-            if best is None or cand["ratio"] > best["ratio"]:
-                best = cand
-        return best
-
-    # Only true chromosome ends. Prefer explicit chrom length so a diagnose
-    # sub-window (e.g. 0-40 Mb) is not treated as a 3' tip.
-    if chrom_length_bp is None:
-        chrom_length_bp = int(hic.shape[0]) * int(args.res)
-    chrom_length_bp = int(chrom_length_bp)
-    tip_tol = max(int(args.res), int(args.min_block))
-    edges = []
-    if int(blocks[0][0]) <= tip_tol:
-        edges.append("right")
-    if abs(int(blocks[-1][1]) - chrom_length_bp) <= tip_tol:
-        edges.append("left")
-
-    flip_min = float(getattr(args, "flip_improve_min", 0.0))
-
-    for edge in edges:
-        best = _scan(edge)
-        if best is None:
-            continue
-        if _already_called(best["start"], best["end"]):
-            continue
-        # Flip-S test on the inward junction: true tip INV improves
-        # continuity; a normal tip that only has S×S anti noise gets worse.
-        target = [best["start"], best["end"], 0]
-        left_span = right_span = None
-        k = int(best["k"])
-        if best["edge_oneside"] == "right" and k < len(blocks):
-            nb = blocks[k]
-            right_span = [int(nb[0]), int(nb[1]), 0]
-        elif best["edge_oneside"] == "left" and k < len(blocks):
-            nb = blocks[-(k + 1)]
-            left_span = [int(nb[0]), int(nb[1]), 0]
-        flip_delta = flip_before = flip_after = float("nan")
-        flip_pass = 1
-        if flip_min > -1e8 and (left_span is not None or right_span is not None):
-            flip_delta, flip_before, flip_after = flip_improvement_score(
-                hic, left_span, target, right_span, args.res, band=band
-            )
-            if not np.isfinite(flip_delta) or float(flip_delta) < flip_min:
-                flip_pass = 0
-                print(
-                    f"[INFO] {chrom} tip anti-diag skip "
-                    f"{best['start']}-{best['end']} "
-                    f"(flipΔ={flip_delta} < {flip_min})",
-                    flush=True,
-                )
-                continue
-        _drop_nested_smaller_tips(best["start"], best["end"])
-        rec = {
-            "start": best["start"],
-            "end": best["end"],
-            "size": best["size"],
-            "left_start": best["start"] if left_span is None else left_span[0],
-            "left_end": best["start"] if left_span is None else left_span[1],
-            "right_start": best["end"] if right_span is None else right_span[0],
-            "right_end": best["end"] if right_span is None else right_span[1],
-            "left_rho": 0.0,
-            "left_p": 1.0,
-            "right_rho": 0.0,
-            "right_p": 1.0,
-            "left_vote": 0,
-            "right_vote": 0,
-            "INV": 1,
-            "gcor_inv": 0,
-            "corner_enrichment": "NA",
-            "corner_pass": 0,
-            "lattice_pass": 1,
-            "parallel_pass": 1,
-            "fill_pass": 1,
-            "signal_pass": 1,
-            "anti_pass": 1,
-            "flip_continuity_before": (
-                flip_before if np.isfinite(flip_before) else "NA"
-            ),
-            "flip_continuity_after": (
-                flip_after if np.isfinite(flip_after) else "NA"
-            ),
-            "flip_improve": flip_delta if np.isfinite(flip_delta) else "NA",
-            "flip_pass": flip_pass,
-            "oneside_ok": 0,
-            "detection_side": f"tip_anti_diag_{best['edge_oneside']}",
-            "detection_strength": best["ratio"],
-            "tip_anti_diag_ratio": best["ratio"],
-            "tip_anti_diag_anti": best["anti"],
-            "tip_anti_diag_diag": best["diag"],
-            "tip_anti_diag_tiles": best["k"],
-            "chrom": chrom,
-            "secondary_split": 0,
-            "gap_bridge": 0,
-        }
-        results.append(rec)
-        print(
-            f"[INFO] {chrom} tip anti-diag rescue "
-            f"{best['start']}-{best['end']} "
-            f"({best['size']/1e6:.2f} Mb) anti/bg={best['ratio']:.2f} "
-            f"tiles={best['k']} side={best['edge_oneside']} "
-            f"flipΔ={flip_delta if np.isfinite(flip_delta) else 'NA'}",
-            flush=True,
-        )
-
-
 def diagnose_region(mcool_file, region, res=50_000, balance=False, outdir="diagnose_out"):
     """
     Simulate why a Juicebox-visible tip/internal INV was (not) called.
@@ -4188,6 +4237,7 @@ def diagnose_region(mcool_file, region, res=50_000, balance=False, outdir="diagn
         min_s_occupancy=0.60,
         max_s_gap_frac=0.25,
         flip_improve_min=0.0,
+        flip_min_pos_scales=2,
         gcor_strong_arm_min=0.5,
         gcor_low_signal_frac=0.0,
         small_inv_max_size=1_000_000,
@@ -4197,11 +4247,7 @@ def diagnose_region(mcool_file, region, res=50_000, balance=False, outdir="diagn
         tip_min_s_occupancy=0.15,
         tip_max_s_gap_frac=0.70,
         tip_allow_nan_corner=True,
-        tip_anti_diag_rescue=False,
         tip_anti_diag_min=3.0,
-        tip_anti_diag_min_size=3_000_000,
-        tip_anti_diag_max_size=30_000_000,
-        tip_anti_diag_max_tiles=12,
         tip_orphan_ratio=0.25,
         oneside_min_size=8_000_000,
         gap_oneside_min_frac=0.10,
@@ -4287,6 +4333,7 @@ def diagnose_region(mcool_file, region, res=50_000, balance=False, outdir="diagn
             f"corner={r.get('corner_pass')} enrich={r.get('corner_enrichment')} "
             f"sig={r.get('signal_pass')} occ={r.get('s_occupancy')} "
             f"gap={r.get('s_gap_frac')} lattice={r.get('lattice_pass')} "
+            f"anti={r.get('anti_pass')} anti/bg={r.get('s_anti_diag_ratio')} "
             f"side={r.get('detection_side')}"
         )
     print("[DIAG] tip oneside:", _gates(rec))
@@ -4320,53 +4367,21 @@ def diagnose_region(mcool_file, region, res=50_000, balance=False, outdir="diagn
             f"(anti={anti_m:.3f} diag={diag_m:.3f})"
         )
 
-    rescue = []
-    _tip_anti_diag_grow_rescue(
-        hic, blocks, args, chrom, rescue, chrom_length_bp=chrom_len
+    print("\n[DIAG] === tip anti-diag gate (default tip_anti_diag_min=3) ===")
+    print(
+        "  Tip oneside requires S×S anti/bg >= tip_anti_diag_min "
+        "(Juicebox X). False tips with strong ρR but no bowtie fail anti_pass."
     )
-    if offset:
-        for r in rescue:
-            r["start"] += offset
-            r["end"] += offset
-            r["left_start"] += offset
-            r["left_end"] += offset
-            r["right_start"] += offset
-            r["right_end"] += offset
-    print("\n[DIAG] tip anti-diag rescue calls:")
-    if not rescue:
-        print("  (none)")
-    for r in rescue:
+    print(
+        "  Louvain may still shatter a true tip X into small tiles whose "
+        "anti/bg never reaches the threshold — check ratios above."
+    )
+    if rec is not None:
         print(
-            f"  CALL {r['start']}-{r['end']} size={r['size']/1e6:.2f}Mb "
-            f"anti/bg={r.get('tip_anti_diag_ratio')} tiles={r.get('tip_anti_diag_tiles')}"
+            f"  => tip parent INV={rec.get('INV')} anti_pass={rec.get('anti_pass')} "
+            f"anti/bg={rec.get('s_anti_diag_ratio')}"
         )
-
-    print("\n[DIAG] === why a Juicebox tip bowtie can be missed ===")
-    print(
-        "  1) Louvain shatters the tip (chr69: first tile ~0-2 Mb, not the "
-        "full ~10 Mb X)."
-    )
-    print(
-        "  2) Merging to the visual bowtie (~5-20 Mb) flips right_rho to the "
-        "WRONG sign (GCOR oneside_ok=0) and corner enrichment collapses."
-    )
-    print(
-        "  3) Strict internal signal gate (min_s_occupancy=0.60) also kills "
-        "the sparse tip tile (occ~0.21) unless tip_min_s_occupancy is used."
-    )
-    print(
-        "  4) tip_anti_diag_rescue grows first/last Louvain tiles by S×S "
-        "anti/background and recovers the bowtie when GCOR cannot."
-    )
-    if rescue:
-        r0 = rescue[0]
-        print(
-            f"  => with rescue: CALL {r0['start']}-{r0['end']} "
-            f"({r0['size']/1e6:.2f} Mb)"
-        )
-    else:
-        print("  => with rescue: still no call (check anti/bg ratios above)")
-    return rescue
+    return rec
 
 
 def process_one_chrom(
@@ -4703,13 +4718,6 @@ def process_one_chrom(
             _secondary_split_and_test(
                 len(tip_blocks)-1, edge_oneside="left", block_list=tip_blocks
             )
-        chrom_len_bp=int(clr.chromsizes[chrom])
-        _tip_anti_diag_grow_rescue(
-            hic, blocks, args, chrom, results, chrom_length_bp=chrom_len_bp
-        )
-
-
-
     if results:
 
 
@@ -4763,6 +4771,23 @@ def run_parallel(args):
     chroms=list(
         clr.chromnames
     )
+    wanted=getattr(args,"chromosomes",None)
+    if wanted:
+        if isinstance(wanted,str):
+            wanted=[c.strip() for c in wanted.split(",") if c.strip()]
+        else:
+            wanted=[str(c).strip() for c in wanted if str(c).strip()]
+        have=set(chroms)
+        missing=[c for c in wanted if c not in have]
+        if missing:
+            raise SystemExit(
+                "[ERROR] --chromosomes not in mcool: "+", ".join(missing)
+            )
+        chroms=wanted
+        print(
+            f"[INFO] INV chromosomes ({len(chroms)}): "+", ".join(chroms),
+            flush=True,
+        )
 
 
 
@@ -6058,25 +6083,14 @@ def merge_multiscale_results(args):
         )
 
 
-        flip_vals=pd.to_numeric(
-            group.get("flip_improve", pd.Series(dtype=float)),
-            errors="coerce"
-        )
-        flip_vals=flip_vals[np.isfinite(flip_vals)]
-        flip_improve=(
-            float(flip_vals.mean()) if len(flip_vals) else float("nan")
-        )
         # Prefer source GCOR ρ from the representative call when present.
+        # flipΔ is recomputed post-merge with flank=|S| (not inherited).
         left_rho=float(representative.get("left_rho", np.nan))
         right_rho=float(representative.get("right_rho", np.nan))
         if not np.isfinite(left_rho):
             left_rho=float(np.mean(features[list(nodes),4]))
         if not np.isfinite(right_rho):
             right_rho=float(np.mean(features[list(nodes),5]))
-        if "flip_improve" in representative.index:
-            fr=pd.to_numeric(representative.get("flip_improve"), errors="coerce")
-            if np.isfinite(fr):
-                flip_improve=float(fr)
 
         merged.append({
             "cluster_id":cid,
@@ -6090,7 +6104,7 @@ def merge_multiscale_results(args):
             ),
             "left_rho":left_rho,
             "right_rho":right_rho,
-            "flip_improve":flip_improve,
+            "flip_improve":float("nan"),
             "event_score":event_score,
             "arm_expanded":0,
             # keep full/core temporarily for arm-expand / dedup; slimmed later
@@ -6113,6 +6127,16 @@ def merge_multiscale_results(args):
 
     if not result.empty:
         result=result.sort_values(["chrom","full_start","full_end"])
+        # Post-merge flip: flank=|S|, vote across merge resolutions.
+        result=apply_post_merge_flip_gate(
+            args.mcool_file,
+            result,
+            resolutions,
+            flip_min=float(getattr(args,"flip_improve_min",0.0)),
+            min_pos_scales=int(getattr(args,"flip_min_pos_scales",2)),
+            balance=bool(getattr(args,"balance",False)),
+            tip_trim_bp=int(getattr(args,"tip_telomere_trim_bp",200_000)),
+        )
 
 
     result.to_csv(
@@ -6267,22 +6291,16 @@ def parse_workflow_args():
         metavar="CHROM[:START-END]",
         help=(
             "simulate gates for a region (e.g. GWHJWDK00000069.1:0-20000000); "
-            "print tip Louvain / GCOR / anti-diag rescue and exit"
+            "print tip Louvain / GCOR / anti-diag gate and exit"
         )
     )
     parser.add_argument(
         "--tip-anti-diag-min",
         type=float,
         default=3.0,
-        help="min S×S anti/background ratio for tip bowtie rescue (default: 3)"
-    )
-    parser.add_argument(
-        "--tip-anti-diag-rescue",
-        action=argparse.BooleanOptionalAction,
-        default=False,
         help=(
-            "enable chrom-tip S×S anti-diagonal grow rescue "
-            "(default: off; use --tip-anti-diag-rescue to turn on)"
+            "chrom-tip oneside: require S×S anti/background >= this "
+            "(Juicebox tip X; default: 3; <=0 disables)"
         )
     )
     parser.add_argument(
@@ -6304,6 +6322,24 @@ def parse_workflow_args():
         help=(
             "small/large size ratio at chrom ends for tip oneside: "
             "< thr → treat LARGE as tip; >= thr → do not (default: 0.25)"
+        )
+    )
+    parser.add_argument(
+        "--tip-telomere-trim-bp",
+        type=int,
+        default=200_000,
+        help=(
+            "chrom-tip INV: drop this many bp from the telomere edge of S "
+            "when scoring GCOR and flip (default: 200000). Call coords still "
+            "include the tip. <=0 disables."
+        )
+    )
+    parser.add_argument(
+        "--chromosomes",
+        default=None,
+        help=(
+            "comma-separated chromosomes to run (default: all in mcool). "
+            "Example: chr1A,chr1B,chr3B"
         )
     )
     parser.add_argument(
@@ -6348,8 +6384,17 @@ def parse_workflow_args():
         type=float,
         default=0.0,
         help=(
-            "min flip continuity delta to accept INV (default: 0.0; "
-            "< -1e8 disables)"
+            "post-merge per-resolution flipΔ must be > this to count "
+            "(default: 0.0 ⇒ strictly > 0; < -1e8 disables flip gate)"
+        )
+    )
+    parser.add_argument(
+        "--flip-min-pos-scales",
+        type=int,
+        default=2,
+        help=(
+            "post-merge: require this many resolutions with flipΔ > "
+            "--flip-improve-min (default: 2); flanks are |S| each side"
         )
     )
     parser.add_argument(
@@ -6366,7 +6411,7 @@ def parse_workflow_args():
         type=int,
         default=1_000_000,
         help=(
-            "|S| <= this uses small-call gates: tighter ρ, flip, anti-diag "
+            "|S| <= this uses small-call gates: tighter ρ, anti-diag "
             "(default: 1000000; <=0 disables)"
         )
     )
@@ -6388,7 +6433,7 @@ def parse_workflow_args():
         "--small-flip-improve-min",
         type=float,
         default=0.2,
-        help="flip continuity min for small calls (default: 0.2)"
+        help="legacy no-op (flip is post-merge; kept for CLI compatibility)"
     )
     parser.add_argument(
         "--parallel-diag-max",
@@ -6419,7 +6464,6 @@ def parse_workflow_args():
         )
     )
     args=parser.parse_args()
-    args.tip_anti_diag_rescue=bool(args.tip_anti_diag_rescue)
     args.gcor_strong_arm_min=float(
         getattr(args,"gcor_strong_arm_min",0.5)
     )
@@ -6427,12 +6471,16 @@ def parse_workflow_args():
     args.tip_min_s_occupancy=float(args.tip_min_s_occupancy)
     args.tip_max_s_gap_frac=float(args.tip_max_s_gap_frac)
     args.tip_orphan_ratio=float(args.tip_orphan_ratio)
+    args.tip_telomere_trim_bp=int(args.tip_telomere_trim_bp)
     args.native_coarse_louvain=bool(args.native_coarse_louvain)
     args.rho_cutoff=float(args.rho_cutoff)
     args.large_block_min_size=int(args.large_block_min_size)
     args.large_block_rho_cutoff=float(args.large_block_rho_cutoff)
     args.gcor_low_signal_frac=float(args.gcor_low_signal_frac)
     args.flip_improve_min=float(args.flip_improve_min)
+    args.flip_min_pos_scales=int(args.flip_min_pos_scales)
+    if args.flip_min_pos_scales<1:
+        parser.error("--flip-min-pos-scales must be >= 1")
     args.small_inv_max_size=int(args.small_inv_max_size)
     args.small_rho_cutoff=float(args.small_rho_cutoff)
     args.small_s_anti_diag_min=float(args.small_s_anti_diag_min)
@@ -6440,10 +6488,6 @@ def parse_workflow_args():
     args.parallel_diag_max=float(args.parallel_diag_max)
     args.direction_lambda=float(args.direction_lambda)
     args.secondary_louvain_resolution=float(args.secondary_louvain_resolution)
-    # kebab → snake aliases used by original_detection_command
-    args.tip_anti_diag_min_size=3_000_000
-    args.tip_anti_diag_max_size=30_000_000
-    args.tip_anti_diag_max_tiles=12
 
     if args.diagnose_region:
         return args
@@ -6499,16 +6543,10 @@ def original_detection_command(
         "--tip_min_s_occupancy",str(getattr(args,"tip_min_s_occupancy",0.15)),
         "--tip_max_s_gap_frac",str(getattr(args,"tip_max_s_gap_frac",0.70)),
         "--tip_anti_diag_min",str(getattr(args,"tip_anti_diag_min",3.0)),
-        "--tip_anti_diag_min_size",str(
-            getattr(args,"tip_anti_diag_min_size",3_000_000)
-        ),
-        "--tip_anti_diag_max_size",str(
-            getattr(args,"tip_anti_diag_max_size",30_000_000)
-        ),
-        "--tip_anti_diag_max_tiles",str(
-            getattr(args,"tip_anti_diag_max_tiles",12)
-        ),
         "--tip_orphan_ratio",str(getattr(args,"tip_orphan_ratio",0.25)),
+        "--tip_telomere_trim_bp",str(
+            getattr(args,"tip_telomere_trim_bp",200_000)
+        ),
         "--rho_cutoff",str(getattr(args,"rho_cutoff",0.3)),
         "--large_block_min_size",str(
             getattr(args,"large_block_min_size",15_000_000)
@@ -6526,6 +6564,9 @@ def original_detection_command(
             getattr(args,"gcor_low_signal_frac",0.0)
         ),
         "--flip_improve_min",str(getattr(args,"flip_improve_min",0.0)),
+        "--flip_min_pos_scales",str(
+            getattr(args,"flip_min_pos_scales",2)
+        ),
         "--gcor_strong_arm_min",str(
             getattr(args,"gcor_strong_arm_min",0.5)
         ),
@@ -6550,10 +6591,8 @@ def original_detection_command(
         "--secondary_split_min_size","3000000",
         ("--balance" if getattr(args,"balance",False) else "--no-balance"),
     ]
-    if bool(getattr(args,"tip_anti_diag_rescue",False)):
-        command.append("--tip_anti_diag_rescue")
-    else:
-        command.append("--no-tip_anti_diag_rescue")
+    if getattr(args,"chromosomes",None):
+        command.extend(["--chromosomes",str(args.chromosomes)])
     if lift_blocks_dir is not None:
         command.extend(["--lift_blocks_dir", str(lift_blocks_dir)])
     return command
@@ -6574,6 +6613,13 @@ def original_merge_command(script,args,merge_inputs,merge_dir):
         "--merge_overlap",str(args.merge_overlap),
         "--merge_gap",str(args.max_merge_gap),
         "--min_scale_support",str(args.min_support),
+        "--flip_improve_min",str(getattr(args,"flip_improve_min",0.0)),
+        "--flip_min_pos_scales",str(
+            getattr(args,"flip_min_pos_scales",2)
+        ),
+        "--tip_telomere_trim_bp",str(
+            getattr(args,"tip_telomere_trim_bp",200_000)
+        ),
         ("--balance" if getattr(args,"balance",False) else "--no-balance"),
         "--multiscale_inputs"
     ]
@@ -7030,6 +7076,7 @@ FINAL_INV_COLUMNS=(
     "left_rho",
     "right_rho",
     "flip_improve",
+    "flip_pos_scales",
     "event_score",
     "arm_expanded",
 )
@@ -7047,6 +7094,8 @@ def slim_final_inv_table(calls):
         out["right_rho"]=out["mean_source_right_rho"]
     if "flip_improve" not in out.columns:
         out["flip_improve"]=np.nan
+    if "flip_pos_scales" not in out.columns:
+        out["flip_pos_scales"]=0
     if "arm_expanded" not in out.columns:
         out["arm_expanded"]=0
     if "event_score" not in out.columns and "max_signal" in out.columns:
@@ -7055,8 +7104,12 @@ def slim_final_inv_table(calls):
     out=out[keep].copy()
     for c in FINAL_INV_COLUMNS:
         if c not in out.columns:
-            out[c]=0 if c in ("scale_support","arm_expanded","size") else (
-                np.nan if c in ("left_rho","right_rho","flip_improve","event_score")
+            out[c]=0 if c in (
+                "scale_support","arm_expanded","size","flip_pos_scales"
+            ) else (
+                np.nan if c in (
+                    "left_rho","right_rho","flip_improve","event_score"
+                )
                 else ""
             )
     out=out[list(FINAL_INV_COLUMNS)]
@@ -7482,23 +7535,10 @@ def plot_flipped_inversions(mcool_file,calls,resolutions,image_dir,balance=False
     base_clr=coolers[want[0]]
 
     def _flip_delta(chrom,s0,s1,res,chrom_size):
-        flank=max(s1-s0,5*res)
-        l0=max(0,s0-flank)
-        r1=min(chrom_size,s1+flank)
-        full=np.nan_to_num(
-            np.asarray(
-                coolers[res].matrix(balance=False).fetch((chrom,l0,r1)),
-                float,
-            ),
-            nan=0.0,
-        )
-        left=(0,s0-l0) if s0>0 else None
-        right=(s1-l0,r1-l0) if s1<chrom_size else None
-        if left is None and right is None:
-            return float("nan")
+        del chrom_size
         try:
-            d,_,_=flip_improvement_score(
-                full,left,(s0-l0,s1-l0),right,res
+            d,_,_=flip_improvement_for_interval(
+                coolers[res],chrom,s0,s1,balance=False
             )
             return float(d)
         except Exception:
@@ -7779,6 +7819,23 @@ def workflow_main():
             parallel_diag_max=float(
                 getattr(args, "parallel_diag_max", 0.30)
             ),
+        )
+        # Final coords (after expand/dedup): flip with flank=|S| at every
+        # workflow resolution; keep if >=2 scales have flipΔ > threshold.
+        print(
+            "[INFO] post-merge multi-resolution flip gate "
+            f"(flank=|S|, need >={getattr(args,'flip_min_pos_scales',2)} "
+            f"scales with flipΔ > {getattr(args,'flip_improve_min',0.0)})",
+            flush=True,
+        )
+        result=apply_post_merge_flip_gate(
+            args.mcool_file,
+            result,
+            resolutions,
+            flip_min=float(getattr(args,"flip_improve_min",0.0)),
+            min_pos_scales=int(getattr(args,"flip_min_pos_scales",2)),
+            balance=bool(getattr(args,"balance",False)),
+            tip_trim_bp=int(getattr(args,"tip_telomere_trim_bp",200_000)),
         )
 
     if not result.empty and (args.hic_alignments or args.fasta):

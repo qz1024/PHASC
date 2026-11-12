@@ -45,7 +45,8 @@ def print_help_message():
   phasc inversion preprocess_out/sample.inv.mapq0.mcool --outdir INV_results
   phasc pipeline --inv-mcool preprocess_out/sample.inv.mapq0.mcool \\
                  --tra-mcool preprocess_out/sample.tra.mapq1.mcool \\
-                 -o PHASC_results --jobs 4 --chromosomes chr3B
+                 -o PHASC_results --jobs 4 --chrom-jobs 8
+                 # TRA default: all mcool chroms in parallel; optional --chromosomes chr1A,chr3B
   phasc correct -f genome.fa --inv PHASC_results/ALL_INV_multiscale.tsv \\
                 --tra PHASC_results/ALL_TRA.tsv -o CORRECT_results --cover-frac 0.9
 

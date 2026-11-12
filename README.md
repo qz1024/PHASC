@@ -242,7 +242,7 @@ Main outputs:
 
 ### `correct`
 
-After INV/TRA detection, correct **contig mounting** mistakes (wrong orientation/order across scaffolding gaps). Splits the FASTA on N-runs, and only corrects a call when it covers ≥ `--cover-frac` of **every** overlapping contig (partial cuts are rejected).
+After INV/TRA detection, correct **contig mounting** mistakes (wrong orientation/order across scaffolding gaps). Splits the FASTA on N-runs, drops tip overlaps covered below `--ignore-cover-below` (default 0.1), then only corrects a call when it covers ≥ `--cover-frac` of **every remaining** overlapping contig.
 
 ```bash
 ./phasc correct \
@@ -250,13 +250,15 @@ After INV/TRA detection, correct **contig mounting** mistakes (wrong orientation
   --inv PHASC_results/ALL_INV_multiscale.tsv \
   --tra PHASC_results/ALL_TRA.tsv \
   -o CORRECT_results \
-  --cover-frac 0.9
+  --cover-frac 0.9 \
+  --ignore-cover-below 0.1
 ```
 
 - **INV**: reverse the spanned contig/gap block and reverse-complement contig sequences
 - **TRA**: move the candidate contig block to immediately before the partner contig block
 - `--dry-run` — write `correction_decisions.tsv` only
 - `--min-gap-n` — minimum N-run length that splits contigs (default: 1)
+- `--ignore-cover-below` — drop contigs covered below this fraction before the cover-frac check (default: 0.1)
 
 Outputs:
 

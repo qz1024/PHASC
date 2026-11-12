@@ -5,9 +5,11 @@ Scaffolding mistakes (wrong contig orientation / order) often look like
 inversions or intra-chromosomal translocations in Hi-C. This script:
 
   1. splits each chromosome by runs of N (gaps) into contigs
-  2. for each INV/TRA interval, checks whether the call covers >= --cover-frac
-     of every overlapping contig (partial cuts reject the call)
-  3. if yes, applies a contig-level correction:
+  2. for each INV/TRA interval, classifies overlapping contig cover:
+       < --ignore-cover-below (default 10%): tip → drop
+       in [ignore, --cover-frac) (default 10–90%): ambiguous → reject call
+       >= --cover-frac (default 90%): keep → correct these contigs
+  3. if kept contigs remain, applies a contig-level correction:
        INV: reverse order of spanned pieces + reverse-complement contig seqs
        TRA: move candidate contig block next to the partner block
 
@@ -142,36 +144,62 @@ def cover_contigs(
     end: int,
     cover_frac: float,
     min_overlap_bp: int = 1,
+    ignore_cover_below: float = 0.1,
 ) -> CoverResult:
-    """Require every overlapping contig to be covered >= cover_frac by [start,end)."""
+    """Three-band cover filter for one INV/TRA interval.
+
+    For every contig overlapping the call:
+      • cover < ignore_cover_below (default 10%): tip → drop
+      • ignore_cover_below ≤ cover < cover_frac (default 10–90%):
+        ambiguous → reject the whole INV/TRA
+      • cover ≥ cover_frac (default ≥90%): keep → correct these contigs
+
+    Only kept (≥ cover_frac) contig ids are returned on success.
+    """
     if end <= start:
         return CoverResult(False, reason="empty_interval")
 
-    hits: list[tuple[int, float]] = []
+    tips: list[tuple[int, float]] = []
+    mids: list[tuple[int, float]] = []
+    fulls: list[tuple[int, float]] = []
     for c in contigs:
         ov = overlap(c.start, c.end, start, end)
         if ov < min_overlap_bp:
             continue
-        hits.append((c.cid, ov / c.length))
+        frac = ov / c.length
+        if frac < ignore_cover_below:
+            tips.append((c.cid, frac))
+        elif frac < cover_frac:
+            mids.append((c.cid, frac))
+        else:
+            fulls.append((c.cid, frac))
 
-    if not hits:
-        return CoverResult(False, reason="no_contig_overlap")
-
-    bad = [(cid, frac) for cid, frac in hits if frac < cover_frac]
-    if bad:
-        detail = ",".join(f"{cid}:{frac:.3f}" for cid, frac in bad)
+    if mids:
+        detail = ",".join(f"{cid}:{frac:.3f}" for cid, frac in mids)
+        # include mid+full ids so the decision table shows what was considered
+        kept = mids + fulls
         return CoverResult(
             False,
-            contig_ids=[cid for cid, _ in hits],
-            fracs=[frac for _, frac in hits],
-            reason=f"partial_cut[{detail}]",
+            contig_ids=[cid for cid, _ in kept],
+            fracs=[frac for _, frac in kept],
+            reason=f"ambiguous_cover[{detail}]",
         )
 
+    if not fulls:
+        if tips:
+            detail = ",".join(f"{cid}:{frac:.3f}" for cid, frac in tips)
+            return CoverResult(False, reason=f"tips_only[{detail}]")
+        return CoverResult(False, reason="no_contig_overlap")
+
+    reason = "ok"
+    if tips:
+        detail = ",".join(f"{cid}:{frac:.3f}" for cid, frac in tips)
+        reason = f"ok_ignore_tips[{detail}]"
     return CoverResult(
         True,
-        contig_ids=[cid for cid, _ in hits],
-        fracs=[frac for _, frac in hits],
-        reason="ok",
+        contig_ids=[cid for cid, _ in fulls],
+        fracs=[frac for _, frac in fulls],
+        reason=reason,
     )
 
 
@@ -350,6 +378,7 @@ def plan_event(
     contigs: list[ContigView],
     cover_frac: float,
     min_overlap_bp: int,
+    ignore_cover_below: float = 0.1,
 ) -> Plan:
     chrom = str(row["chrom"])
     sv = str(row["sv_type"]).upper()
@@ -358,13 +387,17 @@ def plan_event(
     size = int(row.get("size", end - start))
     cid = row.get("cluster_id", ".")
 
-    cov = cover_contigs(contigs, start, end, cover_frac, min_overlap_bp)
+    cov = cover_contigs(
+        contigs, start, end, cover_frac, min_overlap_bp, ignore_cover_below
+    )
     partner_ids: list[int] = []
     p0 = p1 = None
 
     if sv == "TRA":
         p0, p1 = int(row["partner_start"]), int(row["partner_end"])
-        pcov = cover_contigs(contigs, p0, p1, cover_frac, min_overlap_bp)
+        pcov = cover_contigs(
+            contigs, p0, p1, cover_frac, min_overlap_bp, ignore_cover_below
+        )
         if not cov.ok:
             return Plan(
                 chrom, sv, cid, start, end, p0, p1, cov.contig_ids, [],
@@ -381,9 +414,15 @@ def plan_event(
                 cov.fracs, support, size, "skip", "cand_partner_share_contig",
             )
         partner_ids = pcov.contig_ids
+        # keep tip-drop notes from both sides when present
+        reason = cov.reason if cov.reason != "ok" else pcov.reason
+        if cov.reason.startswith("ok_ignore_tips") and pcov.reason.startswith(
+            "ok_ignore_tips"
+        ):
+            reason = f"cand_{cov.reason};partner_{pcov.reason}"
         return Plan(
             chrom, sv, cid, start, end, p0, p1, cov.contig_ids, partner_ids,
-            cov.fracs, support, size, "correct", "ok",
+            cov.fracs, support, size, "correct", reason,
         )
 
     # INV
@@ -394,7 +433,7 @@ def plan_event(
         )
     return Plan(
         chrom, sv, cid, start, end, None, None, cov.contig_ids, [],
-        cov.fracs, support, size, "correct", "ok",
+        cov.fracs, support, size, "correct", cov.reason,
     )
 
 
@@ -441,6 +480,9 @@ def apply_plans(
         else:
             ok = move_tra(pieces, p.contig_ids, p.partner_contig_ids)
             reason = "applied_tra" if ok else "move_span_broken"
+        # keep tip-drop note from planning (ok_ignore_tips[...])
+        if ok and "ok_ignore_tips" in p.reason:
+            reason = f"{reason};{p.reason}"
         out.append(
             Plan(
                 p.chrom, p.sv_type, p.cluster_id, p.start, p.end,
@@ -492,8 +534,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
             "Correct contig mounting errors using PHASC INV/TRA calls: "
-            "split FASTA by N-gaps, require each overlapping contig covered "
-            ">= --cover-frac, then flip (INV) or relocate (TRA) contig blocks."
+            "split FASTA by N-gaps; drop tip overlaps < --ignore-cover-below; "
+            "reject the call if any overlap is in [ignore, cover); "
+            "flip/relocate contigs covered >= --cover-frac."
         )
     )
     p.add_argument("-f", "--fasta", default=None, help="input genome FASTA")
@@ -511,8 +554,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.9,
         help=(
-            "min fraction of each overlapping contig covered by the SV "
-            "(default: 0.9). Any partial cut below this rejects the call."
+            "contigs covered >= this fraction are corrected (default: 0.9). "
+            "Any overlapping contig in [--ignore-cover-below, --cover-frac) "
+            "rejects the whole INV/TRA."
         ),
     )
     p.add_argument(
@@ -520,6 +564,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="ignore contig overlaps shorter than this (default: 1)",
+    )
+    p.add_argument(
+        "--ignore-cover-below",
+        type=float,
+        default=0.1,
+        help=(
+            "drop tip overlaps below this fraction (default: 0.1). "
+            "Overlaps in [this, --cover-frac) discard the event."
+        ),
     )
     p.add_argument(
         "--min-gap-n",
@@ -556,9 +609,37 @@ def self_check() -> None:
     # ACGT NN TTGC -> rev(TTGC)=GCAA NN rev(ACGT)=ACGT
     assert pieces_to_seq(pieces) == "AAAA" + "NN" + "GCAA" + "NN" + "ACGT" + "NN" + "GGGG"
 
-    # partial cut rejects
-    bad = cover_contigs(contigs, contigs[1].start, contigs[1].start + 2, 0.9)
-    assert not bad.ok and "partial_cut" in bad.reason
+    # mid-band cover (10–90%) rejects the whole call
+    bad = cover_contigs(
+        contigs, contigs[1].start, contigs[1].start + 2, 0.9, ignore_cover_below=0.0
+    )
+    assert not bad.ok and "ambiguous_cover" in bad.reason
+
+    # tip <10% dropped; >=90% kept → correct
+    seq_tip = "AAAA" + "NN" + "ACGT" + "NN" + ("C" * 20)
+    _, tip_contigs = split_by_n(seq_tip, 1)
+    tip = cover_contigs(
+        tip_contigs,
+        tip_contigs[1].start,
+        tip_contigs[2].start + 1,  # full contig1 + 1bp into contig2 (1/20=0.05)
+        0.9,
+        ignore_cover_below=0.1,
+    )
+    assert tip.ok and tip.contig_ids == [1], tip
+    assert "ok_ignore_tips" in tip.reason, tip
+
+    # mid-band present → discard even if another contig is fully covered
+    seq_mid = "AAAA" + "NN" + ("A" * 10) + "NN" + ("C" * 10)
+    _, mid_contigs = split_by_n(seq_mid, 1)
+    # cover contig1 fully (10/10) + 5bp of contig2 (5/10=0.5 mid)
+    mid = cover_contigs(
+        mid_contigs,
+        mid_contigs[1].start,
+        mid_contigs[2].start + 5,
+        0.9,
+        ignore_cover_below=0.1,
+    )
+    assert not mid.ok and "ambiguous_cover" in mid.reason, mid
 
     # TRA: move candidate contig 1 before partner contig 3 (keep gap spacing)
     seq3 = "AAAA" + "NN" + "CCCC" + "NN" + "GGGG" + "NN" + "TTTT"
@@ -578,6 +659,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("[ERROR] -f/--fasta is required")
     if not (0 < args.cover_frac <= 1):
         raise SystemExit("[ERROR] --cover-frac must be in (0, 1]")
+    if not (0 <= args.ignore_cover_below < 1):
+        raise SystemExit("[ERROR] --ignore-cover-below must be in [0, 1)")
     if args.min_gap_n < 1:
         raise SystemExit("[ERROR] --min-gap-n must be >= 1")
     if args.min_overlap_bp < 1:
@@ -645,6 +728,7 @@ def main(argv: list[str] | None = None) -> int:
                 contigs_by_chrom[chrom],
                 args.cover_frac,
                 args.min_overlap_bp,
+                args.ignore_cover_below,
             )
         )
 
