@@ -9,9 +9,12 @@ Mirrors ``multiscale_intra_translocation.py``, adapted for chromA↔chromB:
           joint graph (A intra + B intra + A×B inter, top-10% edges)
           → communities spanning both chroms → tip×tip O/E vs chrom-pair mean
   merge across (resolution, gamma) on both arms
-  enrichment gate (default fold > 1.5) → ALL_INTER_TRA.tsv
+  enrichment gate (default fold > 1.5)
+  reciprocal optimize-merge (abutting corner calls → mid×mid exchange)
+      → ALL_INTER_TRA.tsv  (pre-optimize: ALL_INTER_TRA_pre_optimize.tsv)
 
-Clear-insert ILP is skipped (gap-fill is intra-only).
+Intra clear-insert ILP is skipped (gap-fill is intra-only); inter uses
+geometry optimize-merge instead.
 
 Example:
   python multiscale_inter_translocation.py \\
@@ -67,6 +70,9 @@ ALL_INTER_TRA_COLUMNS = [
     "n_members",
     "size_a",
     "size_b",
+    "merged_reciprocal",
+    "n_source_calls",
+    "source_cluster_ids",
 ]
 
 
@@ -817,6 +823,312 @@ def apply_enrichment_gate(
 
 
 # =============================================================================
+# Reciprocal optimize-merge (inter analog of intra clear-insert / mutual-insert)
+# =============================================================================
+
+
+def _calls_abut(a0: int, a1: int, b0: int, b1: int, slack: int = 500_000) -> bool:
+    """True if intervals touch, overlap, or nearly touch."""
+    if a1 <= b0:
+        return (b0 - a1) <= slack
+    if b1 <= a0:
+        return (a0 - b1) <= slack
+    return _overlap(a0, a1, b0, b1) > 0
+
+
+def collapse_overlapping_intervals(
+    intervals: list[tuple[int, int]], min_rec: float = 0.5
+) -> list[tuple[int, int]]:
+    """Cluster high-overlap intervals; abutting neighbors stay separate pieces."""
+    xs = [(int(a), int(b)) for a, b in intervals if b > a]
+    if not xs:
+        return []
+    n = len(xs)
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _reciprocal(xs[i][0], xs[i][1], xs[j][0], xs[j][1]) >= min_rec:
+                union(i, j)
+
+    groups: dict[int, list[tuple[int, int]]] = {}
+    for i, iv in enumerate(xs):
+        groups.setdefault(find(i), []).append(iv)
+    segs = [
+        (min(a for a, _ in members), max(b for _, b in members))
+        for members in groups.values()
+    ]
+    return sorted(segs, key=lambda s: s[0])
+
+
+def _connected_call_components(
+    calls: pd.DataFrame, slack: int = 500_000
+) -> list[list[int]]:
+    n = len(calls)
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if str(calls.at[i, "chrom_a"]) != str(calls.at[j, "chrom_a"]):
+                continue
+            if str(calls.at[i, "chrom_b"]) != str(calls.at[j, "chrom_b"]):
+                continue
+            if _calls_abut(
+                int(calls.at[i, "start_a"]),
+                int(calls.at[i, "end_a"]),
+                int(calls.at[j, "start_a"]),
+                int(calls.at[j, "end_a"]),
+                slack,
+            ) or _calls_abut(
+                int(calls.at[i, "start_b"]),
+                int(calls.at[i, "end_b"]),
+                int(calls.at[j, "start_b"]),
+                int(calls.at[j, "end_b"]),
+                slack,
+            ):
+                union(i, j)
+
+    groups: dict[int, list[int]] = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+    return list(groups.values())
+
+
+def pick_interior_segment(segs: list[tuple[int, int]]) -> tuple[int, int]:
+    """Left/right flanks + mid exchange → keep mid."""
+    if not segs:
+        raise ValueError("empty segments")
+    if len(segs) == 1:
+        return segs[0]
+    if len(segs) == 2:
+        return min(segs, key=lambda s: s[1] - s[0])
+    interior = segs[1:-1]
+    return (interior[0][0], interior[-1][1])
+
+
+def _reconstruct_reciprocal_event(sub: pd.DataFrame) -> dict:
+    segs_a = collapse_overlapping_intervals(
+        [(int(r.start_a), int(r.end_a)) for _, r in sub.iterrows()]
+    )
+    segs_b = collapse_overlapping_intervals(
+        [(int(r.start_b), int(r.end_b)) for _, r in sub.iterrows()]
+    )
+    a0, a1 = pick_interior_segment(segs_a)
+    b0, b1 = pick_interior_segment(segs_b)
+    member_res = ""
+    if "member_resolutions" in sub.columns:
+        member_res = ";".join(
+            str(x) for x in sub["member_resolutions"].astype(str).tolist() if x
+        )
+    return {
+        "chrom_a": str(sub.iloc[0]["chrom_a"]),
+        "start_a": a0,
+        "end_a": a1,
+        "chrom_b": str(sub.iloc[0]["chrom_b"]),
+        "start_b": b0,
+        "end_b": b1,
+        "size_a": a1 - a0,
+        "size_b": b1 - b0,
+        "n_members": int(sub["n_members"].sum())
+        if "n_members" in sub.columns
+        else len(sub),
+        "n_source_calls": len(sub),
+        "source_cluster_ids": ",".join(str(int(x)) for x in sub["cluster_id"]),
+        "scale_support": int(sub["scale_support"].max()),
+        "resolutions": ",".join(
+            sorted(
+                {
+                    p
+                    for s in sub["resolutions"].astype(str)
+                    for p in s.split(",")
+                    if p
+                },
+                key=lambda x: int(x),
+            )
+        ),
+        "gammas": ",".join(
+            sorted(
+                {p for s in sub["gammas"].astype(str) for p in s.split(",") if p},
+                key=lambda x: float(x),
+            )
+        ),
+        "member_resolutions": member_res,
+        "merged_reciprocal": 1,
+        "enrichment_fold": float(sub["enrichment_fold"].max()),
+        "enrichment_fold_block": float(sub["enrichment_fold_block"].max())
+        if "enrichment_fold_block" in sub.columns
+        else float(sub["enrichment_fold"].max()),
+        "enrichment_fold_flank": float(sub["enrichment_fold_flank"].max())
+        if "enrichment_fold_flank" in sub.columns
+        else float(sub["enrichment_fold"].max()),
+    }
+
+
+def optimize_merge_inter_calls(
+    calls: pd.DataFrame,
+    mcool: Path | None = None,
+    abut_bp: int = 500_000,
+    tip_window_bp: int = 2_000_000,
+    score_resolution: int = 50_000,
+    rescore: bool = True,
+) -> pd.DataFrame:
+    """Merge abutting reciprocal corner calls into mid×mid exchange events.
+
+    ponytail: geometry merge only (no ILP). Ceiling = conflicting multi-events
+    on the same arm; upgrade = pulp like intra clear-insert if that appears.
+    """
+    if calls is None or not isinstance(calls, pd.DataFrame) or len(calls) == 0:
+        return empty_inter_tra_table()
+
+    rows: list[dict] = []
+    for idxs in _connected_call_components(calls.reset_index(drop=True), slack=abut_bp):
+        sub = calls.reset_index(drop=True).loc[idxs].copy()
+        if len(sub) == 1:
+            r = sub.iloc[0]
+            rows.append(
+                {
+                    "chrom_a": str(r["chrom_a"]),
+                    "start_a": int(r["start_a"]),
+                    "end_a": int(r["end_a"]),
+                    "chrom_b": str(r["chrom_b"]),
+                    "start_b": int(r["start_b"]),
+                    "end_b": int(r["end_b"]),
+                    "size_a": int(r["end_a"]) - int(r["start_a"]),
+                    "size_b": int(r["end_b"]) - int(r["start_b"]),
+                    "n_members": int(r["n_members"])
+                    if "n_members" in sub.columns
+                    else 1,
+                    "n_source_calls": 1,
+                    "source_cluster_ids": str(int(r["cluster_id"])),
+                    "scale_support": int(r["scale_support"]),
+                    "resolutions": str(r["resolutions"]),
+                    "gammas": str(r["gammas"]),
+                    "member_resolutions": str(r["member_resolutions"])
+                    if "member_resolutions" in sub.columns
+                    else "",
+                    "merged_reciprocal": 0,
+                    "enrichment_fold": float(r["enrichment_fold"]),
+                    "enrichment_fold_block": float(
+                        r["enrichment_fold_block"]
+                        if "enrichment_fold_block" in sub.columns
+                        else r["enrichment_fold"]
+                    ),
+                    "enrichment_fold_flank": float(
+                        r["enrichment_fold_flank"]
+                        if "enrichment_fold_flank" in sub.columns
+                        else r["enrichment_fold"]
+                    ),
+                }
+            )
+        else:
+            rows.append(_reconstruct_reciprocal_event(sub))
+
+    out = pd.DataFrame(rows)
+    if len(out) == 0:
+        return empty_inter_tra_table()
+
+    if rescore and mcool is not None:
+        available = set(discover_resolutions(Path(mcool)))
+        use_res = (
+            score_resolution
+            if score_resolution in available
+            else min(available, key=lambda r: abs(r - score_resolution))
+        )
+        for (ca, cb), idx in out.groupby(["chrom_a", "chrom_b"], sort=False).groups.items():
+            clr = cooler.Cooler(f"{mcool}::/resolutions/{use_res}")
+            size_a = int(clr.chromsizes[str(ca)])
+            size_b = int(clr.chromsizes[str(cb)])
+            pair_mean = chrom_pair_mean_contact(clr, str(ca), str(cb))
+            for i in idx:
+                m = score_inter_event(
+                    clr,
+                    str(ca),
+                    str(cb),
+                    size_a,
+                    size_b,
+                    int(out.at[i, "start_a"]),
+                    int(out.at[i, "end_a"]),
+                    int(out.at[i, "start_b"]),
+                    int(out.at[i, "end_b"]),
+                    pair_mean=pair_mean,
+                    tip_window_bp=tip_window_bp,
+                    resolution=use_res,
+                )
+                for k in (
+                    "enrichment_fold",
+                    "enrichment_fold_block",
+                    "enrichment_fold_flank",
+                ):
+                    val = float(m[k])
+                    if not np.isfinite(val):
+                        val = 0.0
+                    out.at[i, k] = val
+
+    out = out.sort_values(
+        ["chrom_a", "start_a", "chrom_b", "start_b"]
+    ).reset_index(drop=True)
+    out.insert(0, "cluster_id", np.arange(1, len(out) + 1, dtype=int))
+    ordered = [c for c in ALL_INTER_TRA_COLUMNS if c in out.columns]
+    extra = [c for c in out.columns if c not in ordered]
+    return out.loc[:, ordered + extra]
+
+
+def apply_optimize_merge(
+    merged: pd.DataFrame,
+    mcool: Path,
+    outdir: Path | None = None,
+    abut_bp: int = 500_000,
+    tip_window_bp: int = 2_000_000,
+) -> pd.DataFrame:
+    """Write pre-optimize table, run optimize-merge, return optimized calls."""
+    if merged is None or not isinstance(merged, pd.DataFrame):
+        merged = empty_inter_tra_table()
+    if outdir is not None:
+        outdir = Path(outdir)
+        outdir.mkdir(parents=True, exist_ok=True)
+        merged.to_csv(outdir / "ALL_INTER_TRA_pre_optimize.tsv", sep="\t", index=False)
+    if len(merged) == 0:
+        return empty_inter_tra_table()
+    n_before = len(merged)
+    opt = optimize_merge_inter_calls(
+        merged,
+        mcool=Path(mcool),
+        abut_bp=abut_bp,
+        tip_window_bp=tip_window_bp,
+        rescore=True,
+    )
+    n_merged = int(opt["merged_reciprocal"].sum()) if len(opt) and "merged_reciprocal" in opt.columns else 0
+    print(
+        f"[INFO] reciprocal optimize-merge: {n_before} -> {len(opt)} "
+        f"({n_merged} reciprocal event(s) collapsed)",
+        flush=True,
+    )
+    return opt
+
+
+# =============================================================================
 # Plot (optional)
 # =============================================================================
 
@@ -867,6 +1179,182 @@ def plot_inter_pair(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=120)
     plt.close(fig)
+
+
+def plot_joint_hic_annotated(
+    mcool: Path,
+    chrom_a: str,
+    chrom_b: str,
+    size_a: int,
+    size_b: int,
+    calls: pd.DataFrame,
+    out_path: Path,
+    plot_res: int = 500_000,
+) -> None:
+    """Concatenated A+B Hi-C with TRA boxes on AB/BA quadrants."""
+    available = discover_resolutions(mcool)
+    use_plot = plot_res if plot_res in available else max(available)
+    clr = cooler.Cooler(f"{mcool}::/resolutions/{use_plot}")
+    aa = np.nan_to_num(clr.matrix(balance=False).fetch(chrom_a), nan=0.0)
+    bb = np.nan_to_num(clr.matrix(balance=False).fetch(chrom_b), nan=0.0)
+    ab = np.nan_to_num(clr.matrix(balance=False).fetch(chrom_a, chrom_b), nan=0.0)
+    mat = np.block([[aa, ab], [ab.T, bb]])
+    pos = mat[mat > 0]
+    vmax = float(np.percentile(pos, 99)) if pos.size else 1.0
+    vmin = max(float(np.percentile(pos, 5)), 1e-6) if pos.size else 1e-6
+    xmax = (size_a + size_b) / 1e6
+
+    fig, ax = plt.subplots(figsize=(10, 9))
+    im = ax.imshow(
+        mat,
+        origin="lower",
+        aspect="equal",
+        norm=LogNorm(vmin=vmin, vmax=max(vmax, vmin * 10)),
+        extent=[0, xmax, 0, xmax],
+        interpolation="nearest",
+        cmap="YlOrRd",
+    )
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="contacts")
+    ax.axvline(size_a / 1e6, color="white", lw=1.2, ls="--")
+    ax.axhline(size_a / 1e6, color="white", lw=1.2, ls="--")
+    ax.set_xticks([size_a / 2e6, size_a / 1e6 + size_b / 2e6])
+    ax.set_xticklabels([chrom_a, chrom_b])
+    ax.set_yticks([size_a / 2e6, size_a / 1e6 + size_b / 2e6])
+    ax.set_yticklabels([chrom_a, chrom_b])
+    for _, r in calls.iterrows():
+        a0, a1 = int(r["start_a"]) / 1e6, int(r["end_a"]) / 1e6
+        b0, b1 = int(r["start_b"]) / 1e6, int(r["end_b"]) / 1e6
+        ax.add_patch(
+            plt.Rectangle(
+                (size_a / 1e6 + b0, a0),
+                b1 - b0,
+                a1 - a0,
+                fill=False,
+                edgecolor="cyan",
+                lw=2.0,
+            )
+        )
+        ax.add_patch(
+            plt.Rectangle(
+                (a0, size_a / 1e6 + b0),
+                a1 - a0,
+                b1 - b0,
+                fill=False,
+                edgecolor="cyan",
+                lw=2.0,
+            )
+        )
+    ax.set_title(f"Inter-TRA Hi-C {chrom_a}+{chrom_b} ({use_plot // 1000} kb)")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def plot_joint_community(
+    mcool: Path,
+    chrom_a: str,
+    chrom_b: str,
+    size_a: int,
+    size_b: int,
+    calls: pd.DataFrame,
+    out_path: Path,
+    resolution: int = 200_000,
+    gamma: float = 1.0,
+    edge_quantile: float = 0.9,
+    seed: int = 42,
+    min_segment_bp: int = 500_000,
+    bridge_bp: int = 500_000,
+) -> None:
+    """One joint community track (A+B concatenated) for the PLM partition."""
+    available = discover_resolutions(mcool)
+    if resolution not in available:
+        resolution = min(available, key=lambda r: abs(r - resolution))
+    graph, n_a, nodes, edges = build_joint_contact_graph(
+        mcool, chrom_a, chrom_b, resolution, edge_quantile, balance=False
+    )
+    labels = _run_plm(
+        graph,
+        gamma=gamma,
+        seed=_plm_seed(seed, resolution=resolution, gamma=gamma),
+    )
+    segs = run_length_segments(labels)
+    cands = detect_inter_candidates(
+        labels,
+        n_a,
+        resolution,
+        gamma,
+        chrom_a,
+        chrom_b,
+        size_a,
+        size_b,
+        min_segment_bp,
+        bridge_bp,
+    )
+    shared = set(int(x) for x in cands["label"].tolist()) if len(cands) else set()
+    total = size_a + size_b
+    ymax = float(segs["label"].max()) if len(segs) else 1.0
+
+    fig, ax = plt.subplots(figsize=(14, 4.5))
+    for _, s in segs.iterrows():
+        lab = int(s["label"])
+        b0, b1 = int(s["start_bin"]), int(s["end_bin"])
+        if b1 <= n_a:
+            x0, x1 = b0 * resolution, min(b1 * resolution, size_a)
+        elif b0 >= n_a:
+            x0 = size_a + (b0 - n_a) * resolution
+            x1 = size_a + min((b1 - n_a) * resolution, size_b)
+        else:
+            x0, x1 = b0 * resolution, size_a
+            ax.plot(
+                [x0 / 1e6, x1 / 1e6],
+                [lab, lab],
+                color="red" if lab in shared else "royalblue",
+                lw=4.0 if lab in shared else 2.0,
+                solid_capstyle="butt",
+            )
+            x0 = size_a
+            x1 = size_a + min((b1 - n_a) * resolution, size_b)
+        ax.plot(
+            [x0 / 1e6, x1 / 1e6],
+            [lab, lab],
+            color="red" if lab in shared else "royalblue",
+            lw=4.0 if lab in shared else 2.0,
+            alpha=0.95 if lab in shared else 0.75,
+            solid_capstyle="butt",
+        )
+    for _, r in calls.iterrows():
+        ax.axvspan(
+            int(r["start_a"]) / 1e6,
+            int(r["end_a"]) / 1e6,
+            color="#00ff66",
+            alpha=0.15,
+            zorder=0,
+        )
+        ax.axvspan(
+            (size_a + int(r["start_b"])) / 1e6,
+            (size_a + int(r["end_b"])) / 1e6,
+            color="#00ff66",
+            alpha=0.15,
+            zorder=0,
+        )
+    ax.axvline(size_a / 1e6, color="k", ls="--", lw=1.2)
+    ax.set_xlim(0, total / 1e6)
+    ax.set_ylim(-2, ymax * 1.08)
+    ax.set_xticks([size_a / 2e6, size_a / 1e6 + size_b / 2e6])
+    ax.set_xticklabels([chrom_a, chrom_b])
+    ax.set_ylabel("community id")
+    ax.set_title(
+        f"Joint PLM communities {chrom_a}+{chrom_b}  "
+        f"(r={resolution // 1000} kb, γ={gamma:g}, nodes={nodes}, edges={edges})\n"
+        f"red=shared TRA communities {sorted(shared)}; green=final TRA calls"
+    )
+    ax.grid(True, axis="x", alpha=0.25)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[INFO] community plot -> {out_path}", flush=True)
 
 
 # =============================================================================
@@ -960,12 +1448,13 @@ def _run_one_res_gamma(payload: dict) -> dict:
     true["role"] = "true"
     true["gamma"] = gamma
 
-    tag = f"{chrom_a}__{chrom_b}_r{res}_g{gamma:g}"
-    res_dir = outdir / tag
-    res_dir.mkdir(parents=True, exist_ok=True)
-    calls.to_csv(res_dir / "calls_input.tsv", sep="\t", index=False)
-    cands.to_csv(res_dir / "scale_candidates.tsv", sep="\t", index=False)
-    true.to_csv(res_dir / "true_calls.tsv", sep="\t", index=False)
+    if bool(payload.get("write_scale_dirs", False)):
+        tag = f"{chrom_a}__{chrom_b}_r{res}_g{gamma:g}"
+        res_dir = outdir / tag
+        res_dir.mkdir(parents=True, exist_ok=True)
+        calls.to_csv(res_dir / "calls_input.tsv", sep="\t", index=False)
+        cands.to_csv(res_dir / "scale_candidates.tsv", sep="\t", index=False)
+        true.to_csv(res_dir / "true_calls.tsv", sep="\t", index=False)
 
     log(f"[RES {res} g={gamma:g}] n_cand={len(calls)} n_true={len(true)}")
     return {
@@ -1075,6 +1564,7 @@ def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
                         "min_true_fold": float(args.min_true_fold),
                         "skip_enrichment": bool(args.skip_enrichment),
                         "tip_window_bp": int(args.tip_window_bp),
+                        "write_scale_dirs": bool(args.write_scale_dirs),
                     }
                 )
 
@@ -1122,7 +1612,9 @@ def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
         if result.get("cands") is not None and len(result["cands"]):
             all_cands.append(result["cands"])
 
-    # flatten to (res, gamma) dict expected by merge — but multiple pairs may share keys.
+    compact = bool(getattr(args, "compact", True))
+    aux_outdir = None if compact else args.outdir
+
     # Merge per chrom-pair, then concat.
     merged_frames: list[pd.DataFrame] = []
     pair_keys = sorted({(str(k[2]), str(k[3])) for k in true_tables})
@@ -1135,18 +1627,6 @@ def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
         m = merge_true_across_resolutions(sub, min_rec=args.merge_min_rec)
         if len(m):
             merged_frames.append(m)
-            if not args.skip_plot:
-                size_a = int(chromsizes.loc[ca])
-                size_b = int(chromsizes.loc[cb])
-                plot_inter_pair(
-                    args.mcool,
-                    ca,
-                    cb,
-                    size_a,
-                    size_b,
-                    m,
-                    plot_dir / f"inter_tra_{ca}__{cb}.png",
-                )
 
     if merged_frames:
         merged = pd.concat(merged_frames, ignore_index=True)
@@ -1154,39 +1634,82 @@ def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
         merged = apply_enrichment_gate(
             merged,
             min_enrichment_fold=float(args.min_enrichment_fold),
-            outdir=args.outdir,
+            outdir=aux_outdir,
         )
     else:
         merged = empty_inter_tra_table()
+
+    if not args.skip_optimize_merge and len(merged):
+        merged = apply_optimize_merge(
+            merged,
+            mcool=args.mcool,
+            outdir=aux_outdir,
+            abut_bp=int(args.optimize_abut_bp),
+            tip_window_bp=int(args.tip_window_bp),
+        )
+    elif len(merged) and not compact:
         merged.to_csv(
-            args.outdir / "ALL_INTER_TRA_pre_enrichment.tsv", sep="\t", index=False
+            args.outdir / "ALL_INTER_TRA_pre_optimize.tsv", sep="\t", index=False
         )
-        empty_inter_tra_table().to_csv(
-            args.outdir / "ALL_INTER_TRA_enrichment_dropped.tsv", sep="\t", index=False
-        )
+        print("[INFO] reciprocal optimize-merge skipped", flush=True)
 
     ordered = [c for c in ALL_INTER_TRA_COLUMNS if c in merged.columns]
     extra = [c for c in merged.columns if c not in ordered]
     if ordered or extra:
         merged = merged.loc[:, ordered + extra]
 
-    merged_path = args.outdir / "merged_true_calls.tsv"
     tra_path = args.outdir / "ALL_INTER_TRA.tsv"
-    merged.to_csv(merged_path, sep="\t", index=False)
     merged.to_csv(tra_path, sep="\t", index=False)
-    print(f"\n[INFO] merged true calls: {len(merged)} -> {merged_path}", flush=True)
-    print(f"[INFO] ALL_INTER_TRA.tsv -> {tra_path}", flush=True)
+    print(f"\n[INFO] ALL_INTER_TRA.tsv -> {tra_path}  (n={len(merged)})", flush=True)
 
-    if all_cands:
-        pd.concat(all_cands, ignore_index=True).to_csv(
-            args.outdir / "ALL_INTER_TRA_per_scale_candidates.tsv",
-            sep="\t",
-            index=False,
-        )
-    if summary_rows:
-        pd.DataFrame(summary_rows).to_csv(
-            args.outdir / "per_resolution_summary.tsv", sep="\t", index=False
-        )
+    if not compact:
+        merged.to_csv(args.outdir / "merged_true_calls.tsv", sep="\t", index=False)
+        if all_cands:
+            pd.concat(all_cands, ignore_index=True).to_csv(
+                args.outdir / "ALL_INTER_TRA_per_scale_candidates.tsv",
+                sep="\t",
+                index=False,
+            )
+        if summary_rows:
+            pd.DataFrame(summary_rows).to_csv(
+                args.outdir / "per_resolution_summary.tsv", sep="\t", index=False
+            )
+
+    # final plots only: community + annotated Hi-C
+    if not args.skip_plot and len(merged):
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        for (ca, cb), sub in merged.groupby(["chrom_a", "chrom_b"], sort=False):
+            ca, cb = str(ca), str(cb)
+            size_a = int(chromsizes.loc[ca])
+            size_b = int(chromsizes.loc[cb])
+            plot_joint_community(
+                args.mcool,
+                ca,
+                cb,
+                size_a,
+                size_b,
+                sub,
+                plot_dir / f"community_{ca}_{cb}.png",
+                resolution=200_000,
+                gamma=1.0,
+                edge_quantile=float(args.edge_quantile),
+                seed=int(args.seed),
+                min_segment_bp=int(args.min_segment_bp),
+                bridge_bp=int(args.bridge_bp),
+            )
+            plot_joint_hic_annotated(
+                args.mcool,
+                ca,
+                cb,
+                size_a,
+                size_b,
+                sub,
+                plot_dir / f"hic_{ca}_{cb}_annotated.png",
+            )
+            print(
+                f"[INFO] Hi-C annotated -> {plot_dir / f'hic_{ca}_{cb}_annotated.png'}",
+                flush=True,
+            )
     return merged
 
 
@@ -1260,9 +1783,32 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--merge-min-rec", type=float, default=0.5)
     ap.add_argument("--skip-plot", action="store_true")
     ap.add_argument(
+        "--compact",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="compact outputs: ALL_INTER_TRA.tsv + community/Hi-C plots only "
+        "(default: true; use --no-compact for intermediates)",
+    )
+    ap.add_argument(
+        "--write-scale-dirs",
+        action="store_true",
+        help="write per-(resolution,gamma) folders (off by default)",
+    )
+    ap.add_argument(
         "--skip-enrichment",
         action="store_true",
         help="do not re-score enrichment (use fold=1)",
+    )
+    ap.add_argument(
+        "--skip-optimize-merge",
+        action="store_true",
+        help="skip reciprocal corner-call optimize-merge after enrichment gate",
+    )
+    ap.add_argument(
+        "--optimize-abut-bp",
+        type=int,
+        default=500_000,
+        help="abut slack for reciprocal optimize-merge (default: 500 kb)",
     )
     ap.add_argument(
         "--jobs",
@@ -1299,6 +1845,10 @@ def main(argv: list[str] | None = None) -> pd.DataFrame:
         f"  edge_quantile       = {args.edge_quantile}\n"
         f"  min-enrichment-fold = {args.min_enrichment_fold}\n"
         f"  tip-window-bp       = {args.tip_window_bp}\n"
+        f"  optimize-merge      = {not args.skip_optimize_merge}\n"
+        f"  optimize-abut-bp    = {args.optimize_abut_bp}\n"
+        f"  compact             = {args.compact}\n"
+        f"  write-scale-dirs    = {args.write_scale_dirs}\n"
         f"  outdir              = {args.outdir}",
         flush=True,
     )
@@ -1340,6 +1890,94 @@ def _self_check() -> None:
         {"chrom_a": "A", "start_a": 10, "end_a": 90, "chrom_b": "B", "start_b": 20, "end_b": 80},
         0.5,
     )
+    # reciprocal corner calls → one mid×mid exchange
+    corner = pd.DataFrame(
+        [
+            {
+                "cluster_id": 1,
+                "chrom_a": "A",
+                "start_a": 0,
+                "end_a": 28_000_000,
+                "chrom_b": "B",
+                "start_b": 797_000_000,
+                "end_b": 835_500_000,
+                "enrichment_fold": 100.0,
+                "enrichment_fold_block": 20.0,
+                "enrichment_fold_flank": 10.0,
+                "scale_support": 10,
+                "resolutions": "50000,100000",
+                "gammas": "1",
+                "member_resolutions": "",
+                "n_members": 10,
+                "size_a": 28_000_000,
+                "size_b": 38_500_000,
+            },
+            {
+                "cluster_id": 2,
+                "chrom_a": "A",
+                "start_a": 27_800_000,
+                "end_a": 66_200_000,
+                "chrom_b": "B",
+                "start_b": 835_600_000,
+                "end_b": 873_000_000,
+                "enrichment_fold": 80.0,
+                "enrichment_fold_block": 10.0,
+                "enrichment_fold_flank": 10.0,
+                "scale_support": 8,
+                "resolutions": "50000,100000",
+                "gammas": "1",
+                "member_resolutions": "",
+                "n_members": 8,
+                "size_a": 38_400_000,
+                "size_b": 37_400_000,
+            },
+            {
+                "cluster_id": 3,
+                "chrom_a": "A",
+                "start_a": 28_000_000,
+                "end_a": 66_500_000,
+                "chrom_b": "B",
+                "start_b": 667_500_000,
+                "end_b": 797_500_000,
+                "enrichment_fold": 120.0,
+                "enrichment_fold_block": 15.0,
+                "enrichment_fold_flank": 7.0,
+                "scale_support": 7,
+                "resolutions": "50000,100000",
+                "gammas": "1",
+                "member_resolutions": "",
+                "n_members": 7,
+                "size_a": 38_500_000,
+                "size_b": 130_000_000,
+            },
+            {
+                "cluster_id": 4,
+                "chrom_a": "A",
+                "start_a": 66_200_000,
+                "end_a": 759_000_000,
+                "chrom_b": "B",
+                "start_b": 797_200_000,
+                "end_b": 819_600_000,
+                "enrichment_fold": 90.0,
+                "enrichment_fold_block": 7.0,
+                "enrichment_fold_flank": 10.0,
+                "scale_support": 9,
+                "resolutions": "50000,100000",
+                "gammas": "1",
+                "member_resolutions": "",
+                "n_members": 9,
+                "size_a": 692_800_000,
+                "size_b": 22_400_000,
+            },
+        ]
+    )
+    opt = optimize_merge_inter_calls(corner, mcool=None, rescore=False)
+    assert len(opt) == 1, opt
+    assert int(opt.iloc[0]["merged_reciprocal"]) == 1
+    assert int(opt.iloc[0]["start_a"]) == 27_800_000
+    assert int(opt.iloc[0]["end_a"]) == 66_500_000
+    assert int(opt.iloc[0]["start_b"]) == 797_000_000
+    assert int(opt.iloc[0]["end_b"]) == 835_500_000
     print("[self-check] ok")
 
 
