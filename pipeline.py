@@ -478,6 +478,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="keep temporary work dirs under outdir/.pipeline_work",
     )
+    parser.add_argument(
+        "--evaluate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "after INV/TRA, write HiC-SCI from call tables into outdir/SCI "
+            "(default: --evaluate; uses ALL_INV/ALL_TRA, no re-detection)"
+        ),
+    )
+    parser.add_argument(
+        "--evaluate-penalty-scale",
+        default="25,12",
+        help="evaluate --penalty-scale inv,tra (default: 25,12)",
+    )
     return parser
 
 
@@ -649,6 +663,32 @@ def main(argv: list[str] | None = None) -> int:
     if combined is not None:
         promoted.append(combined.name)
         print(f"[DONE] combined SV table -> {combined}", flush=True)
+
+    if args.evaluate:
+        try:
+            # Lazy import: evaluate pulls cooler/networkx; only needed here.
+            sys.path.insert(0, str(base_dir))
+            from evaluate import score_sci_from_calls
+
+            sci_dir = outdir / "SCI"
+            chrom_list = chroms if args.chromosomes else None
+            summary = score_sci_from_calls(
+                mcool=str(inv_mcool),
+                calls_dir=outdir,
+                sci_outdir=sci_dir,
+                penalty_scale=args.evaluate_penalty_scale,
+                chromosomes=chrom_list,
+            )
+            promoted.append("SCI")
+            print(
+                f"[DONE] HiC-SCI={summary.get('total_score_0_100')} "
+                f"(INV={summary.get('component_scores_0_100', {}).get('inversion_score')}, "
+                f"TRA={summary.get('component_scores_0_100', {}).get('translocation_score')}) "
+                f"-> {sci_dir}",
+                flush=True,
+            )
+        except Exception as exc:  # noqa: BLE001 — detection already succeeded
+            print(f"[WARN] evaluate scoring skipped: {exc}", flush=True)
 
     if not args.keep_work:
         shutil.rmtree(work_root, ignore_errors=True)

@@ -32,6 +32,7 @@ def print_help_message():
   \033[1mintra-translocation\033[0m Detect intra-chromosomal translocations from mcool data  (multiscale_intra_translocation.py)
   \033[1minter-translocation\033[0m Detect inter-chromosomal translocations from mcool data  (multiscale_inter_translocation.py)
   \033[1mpipeline\033[0m         Run inversion + translocation in parallel into one outdir   (pipeline.py)
+  \033[1mevaluate\033[0m         HiC-SCI structural score (use --from-calls after pipeline)  (evaluate.py)
   \033[1mcorrect\033[0m          Correct contig mounting errors from INV/TRA vs N-split      (correct_scaffold.py)
 
 \033[1;34mEXAMPLE:\033[0m
@@ -83,6 +84,7 @@ def main():
             os.path.join(base_dir, "multiscale_inter_translocation.py"),
         ],
         "pipeline": [sys.executable, os.path.join(base_dir, "pipeline.py")],
+        "evaluate": [sys.executable, os.path.join(base_dir, "evaluate.py")],
         "correct": [sys.executable, os.path.join(base_dir, "correct_scaffold.py")],
     }
 

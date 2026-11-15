@@ -7,14 +7,17 @@ Mirrors ``multiscale_intra_translocation.py``, adapted for chromA↔chromB:
   for Hi-C resolution in {50,100,200,500} kb:
       for Louvain/PLM gamma in {0.5, 0.75, 1.0, 1.25, 1.5, 2.0}:
           joint graph (A intra + B intra + A×B inter, top-10% edges)
-          → communities spanning both chroms → tip×tip O/E vs chrom-pair mean
+          → communities spanning both chroms
+  home community = longest private label per chrom; peel shared labels
+      smallest-first, restore bins onto home (no PLM recompute)
+  tip×tip O/E vs chrom-pair mean
   merge across (resolution, gamma) on both arms
   enrichment gate (default fold > 1.5)
-  reciprocal optimize-merge (abutting corner calls → mid×mid exchange)
+  reciprocal optimize-merge (both-arm abutting corners → mid×mid exchange)
       → ALL_INTER_TRA.tsv  (pre-optimize: ALL_INTER_TRA_pre_optimize.tsv)
 
 Intra clear-insert ILP is skipped (gap-fill is intra-only); inter uses
-geometry optimize-merge instead.
+home-peel + geometry optimize-merge (both-arm abut only).
 
 Example:
   python multiscale_inter_translocation.py \\
@@ -169,6 +172,47 @@ def _largest_block_per_label(
     return out
 
 
+def pick_home_labels(
+    blocks_a: dict[int, tuple[int, int, int, int]],
+    blocks_b: dict[int, tuple[int, int, int, int]],
+) -> tuple[int | None, int | None]:
+    """Longest private (non-shared) community per chrom = home / 本命社区.
+
+    ponytail: if no private label, fall back to longest block on that arm
+    (ceiling = all labels shared; upgrade = recompute after peel).
+    """
+    shared = set(blocks_a) & set(blocks_b)
+    private_a = [lab for lab in blocks_a if lab not in shared]
+    private_b = [lab for lab in blocks_b if lab not in shared]
+
+    def _longest(blocks: dict[int, tuple[int, int, int, int]], labs: list[int]) -> int | None:
+        if not labs:
+            return None
+        return max(labs, key=lambda lab: blocks[lab][3] - blocks[lab][2])
+
+    home_a = _longest(blocks_a, private_a)
+    home_b = _longest(blocks_b, private_b)
+    if home_a is None and blocks_a:
+        home_a = _longest(blocks_a, list(blocks_a))
+    if home_b is None and blocks_b:
+        home_b = _longest(blocks_b, list(blocks_b))
+    return home_a, home_b
+
+
+def _restore_target(
+    home: int | None,
+    peeled: int,
+    blocks: dict[int, tuple[int, int, int, int]],
+) -> int | None:
+    """Label to paint peeled bins onto; never the peeled label itself."""
+    if home is not None and int(home) != int(peeled):
+        return int(home)
+    others = [lab for lab in blocks if int(lab) != int(peeled)]
+    if not others:
+        return None
+    return max(others, key=lambda lab: blocks[lab][3] - blocks[lab][2])
+
+
 def detect_inter_candidates(
     labels_joint: np.ndarray,
     n_a: int,
@@ -180,22 +224,96 @@ def detect_inter_candidates(
     size_b: int,
     min_segment_bp: int,
     bridge_bp: int,
+    home_peel: bool = True,
 ) -> pd.DataFrame:
-    """Shared community labels with a substantial block on *both* chromosomes."""
+    """Shared-label TRA candidates on both chromosomes.
+
+    Default ``home_peel``: fix per-chrom home (longest private community),
+    then iteratively peel the smallest shared label, record it, and restore
+    those bins onto home (no PLM recompute). Private non-home ignored.
+    ``home_peel=False``: legacy dump of all shared labels (label-sorted).
+    """
     min_bins = max(2, math.ceil(min_segment_bp / resolution))
     bridge_bins = max(0, math.floor(bridge_bp / resolution))
-    labels_a = labels_joint[:n_a]
-    labels_b = labels_joint[n_a:]
-    blocks_a = _largest_block_per_label(
-        labels_a, resolution, size_a, min_bins, bridge_bins
-    )
-    blocks_b = _largest_block_per_label(
-        labels_b, resolution, size_b, min_bins, bridge_bins
-    )
-    shared = sorted(set(blocks_a) & set(blocks_b))
     scale_id = f"r{resolution}_g{gamma:g}"
-    records = []
-    for lab in shared:
+
+    if not home_peel:
+        labels_a = labels_joint[:n_a]
+        labels_b = labels_joint[n_a:]
+        blocks_a = _largest_block_per_label(
+            labels_a, resolution, size_a, min_bins, bridge_bins
+        )
+        blocks_b = _largest_block_per_label(
+            labels_b, resolution, size_b, min_bins, bridge_bins
+        )
+        shared = sorted(set(blocks_a) & set(blocks_b))
+        home_a, home_b = pick_home_labels(blocks_a, blocks_b)
+        records = []
+        for lab in shared:
+            sa0, sa1, a0, a1 = blocks_a[lab]
+            sb0, sb1, b0, b1 = blocks_b[lab]
+            records.append(
+                {
+                    "scale_id": scale_id,
+                    "resolution": resolution,
+                    "gamma": gamma,
+                    "label": lab,
+                    "chrom_a": chrom_a,
+                    "start_a_bin": sa0,
+                    "end_a_bin": sa1,
+                    "start_a": a0,
+                    "end_a": a1,
+                    "chrom_b": chrom_b,
+                    "start_b_bin": sb0,
+                    "end_b_bin": sb1,
+                    "start_b": b0,
+                    "end_b": b1,
+                    "length_a_bp": a1 - a0,
+                    "length_b_bp": b1 - b0,
+                    "home_a": home_a if home_a is not None else -1,
+                    "home_b": home_b if home_b is not None else -1,
+                    "peel_size": min(a1 - a0, b1 - b0),
+                    "peel_order": 0,
+                }
+            )
+        if not records:
+            return pd.DataFrame(columns=CANDIDATE_COLUMNS)
+        return pd.DataFrame(records).sort_values(["label"]).reset_index(drop=True)
+
+    # --- home-peel with restore ---
+    work = np.asarray(labels_joint, dtype=np.int64).copy()
+    blocks_a0 = _largest_block_per_label(
+        work[:n_a], resolution, size_a, min_bins, bridge_bins
+    )
+    blocks_b0 = _largest_block_per_label(
+        work[n_a:], resolution, size_b, min_bins, bridge_bins
+    )
+    home_a, home_b = pick_home_labels(blocks_a0, blocks_b0)
+    records: list[dict] = []
+    # ponytail: finite steps; each peel removes ≥1 label from shared set
+    for peel_i in range(max(1, len(set(work.tolist())) + 2)):
+        blocks_a = _largest_block_per_label(
+            work[:n_a], resolution, size_a, min_bins, bridge_bins
+        )
+        blocks_b = _largest_block_per_label(
+            work[n_a:], resolution, size_b, min_bins, bridge_bins
+        )
+        shared = set(blocks_a) & set(blocks_b)
+        # home is background — never peel it even if it also appears cross-chrom
+        if home_a is not None:
+            shared.discard(int(home_a))
+        if home_b is not None:
+            shared.discard(int(home_b))
+        if not shared:
+            break
+
+        def _peel_key(lab: int) -> tuple:
+            _sa0, _sa1, a0, a1 = blocks_a[lab]
+            _sb0, _sb1, b0, b1 = blocks_b[lab]
+            la, lb = a1 - a0, b1 - b0
+            return (min(la, lb), la, lb, int(lab))
+
+        lab = min(shared, key=_peel_key)
         sa0, sa1, a0, a1 = blocks_a[lab]
         sb0, sb1, b0, b1 = blocks_b[lab]
         records.append(
@@ -203,7 +321,7 @@ def detect_inter_candidates(
                 "scale_id": scale_id,
                 "resolution": resolution,
                 "gamma": gamma,
-                "label": lab,
+                "label": int(lab),
                 "chrom_a": chrom_a,
                 "start_a_bin": sa0,
                 "end_a_bin": sa1,
@@ -216,8 +334,22 @@ def detect_inter_candidates(
                 "end_b": b1,
                 "length_a_bp": a1 - a0,
                 "length_b_bp": b1 - b0,
+                "home_a": home_a if home_a is not None else -1,
+                "home_b": home_b if home_b is not None else -1,
+                "peel_size": min(a1 - a0, b1 - b0),
+                "peel_order": peel_i + 1,
             }
         )
+        ta = _restore_target(home_a, int(lab), blocks_a)
+        tb = _restore_target(home_b, int(lab), blocks_b)
+        if ta is None and tb is None:
+            break
+        # restore only the recorded largest sub-block (not every bin of label)
+        if ta is not None:
+            work[:n_a][sa0:sa1] = int(ta)
+        if tb is not None:
+            work[n_a:][sb0:sb1] = int(tb)
+
     if not records:
         return pd.DataFrame(columns=CANDIDATE_COLUMNS)
     return pd.DataFrame(records)
@@ -550,6 +682,7 @@ def analyze_scale(
     bridge_bp: int,
     networkit_threads: int,
     plm_par: str = "balanced",
+    home_peel: bool = True,
 ) -> tuple[int, float, int, int, pd.DataFrame]:
     n_threads = 1 if str(plm_par) == "none" else max(1, networkit_threads)
     if hasattr(nk, "setNumberOfThreads"):
@@ -574,6 +707,7 @@ def analyze_scale(
         size_b,
         min_segment_bp,
         bridge_bp,
+        home_peel=home_peel,
     )
     return resolution, gamma, nodes, edges, cands
 
@@ -875,6 +1009,11 @@ def collapse_overlapping_intervals(
 def _connected_call_components(
     calls: pd.DataFrame, slack: int = 500_000
 ) -> list[list[int]]:
+    """Link calls only when *both* arms abut (same reciprocal event corners).
+
+    Mirror intra clear-insert: merge only same-event geometry. OR-abut on one
+    arm chains independent multi-events on the same chrom pair into one blob.
+    """
     n = len(calls)
     parent = list(range(n))
 
@@ -895,13 +1034,14 @@ def _connected_call_components(
                 continue
             if str(calls.at[i, "chrom_b"]) != str(calls.at[j, "chrom_b"]):
                 continue
+            # both arms must abut — same spirit as cross-scale both-arm overlap
             if _calls_abut(
                 int(calls.at[i, "start_a"]),
                 int(calls.at[i, "end_a"]),
                 int(calls.at[j, "start_a"]),
                 int(calls.at[j, "end_a"]),
                 slack,
-            ) or _calls_abut(
+            ) and _calls_abut(
                 int(calls.at[i, "start_b"]),
                 int(calls.at[i, "end_b"]),
                 int(calls.at[j, "start_b"]),
@@ -914,6 +1054,18 @@ def _connected_call_components(
     for i in range(n):
         groups.setdefault(find(i), []).append(i)
     return list(groups.values())
+
+
+def _segs_form_abut_chain(
+    segs: list[tuple[int, int]], slack: int = 500_000
+) -> bool:
+    """True if sorted segments form one abutting chain (one exchange locus)."""
+    if len(segs) <= 1:
+        return True
+    for (a0, a1), (b0, b1) in zip(segs, segs[1:]):
+        if not _calls_abut(a0, a1, b0, b1, slack):
+            return False
+    return True
 
 
 def pick_interior_segment(segs: list[tuple[int, int]]) -> tuple[int, int]:
@@ -986,6 +1138,42 @@ def _reconstruct_reciprocal_event(sub: pd.DataFrame) -> dict:
     }
 
 
+def _singleton_call_row(r: pd.Series, n_source: int = 1) -> dict:
+    return {
+        "chrom_a": str(r["chrom_a"]),
+        "start_a": int(r["start_a"]),
+        "end_a": int(r["end_a"]),
+        "chrom_b": str(r["chrom_b"]),
+        "start_b": int(r["start_b"]),
+        "end_b": int(r["end_b"]),
+        "size_a": int(r["end_a"]) - int(r["start_a"]),
+        "size_b": int(r["end_b"]) - int(r["start_b"]),
+        "n_members": int(r["n_members"]) if "n_members" in r.index else 1,
+        "n_source_calls": int(n_source),
+        "source_cluster_ids": str(int(r["cluster_id"])),
+        "scale_support": int(r["scale_support"]),
+        "resolutions": str(r["resolutions"]),
+        "gammas": str(r["gammas"]),
+        "member_resolutions": str(r["member_resolutions"])
+        if "member_resolutions" in r.index
+        else "",
+        "merged_reciprocal": 0,
+        "enrichment_fold": float(r["enrichment_fold"]),
+        "enrichment_fold_block": float(
+            r["enrichment_fold_block"]
+            if "enrichment_fold_block" in r.index
+            and pd.notna(r.get("enrichment_fold_block"))
+            else r["enrichment_fold"]
+        ),
+        "enrichment_fold_flank": float(
+            r["enrichment_fold_flank"]
+            if "enrichment_fold_flank" in r.index
+            and pd.notna(r.get("enrichment_fold_flank"))
+            else r["enrichment_fold"]
+        ),
+    }
+
+
 def optimize_merge_inter_calls(
     calls: pd.DataFrame,
     mcool: Path | None = None,
@@ -996,8 +1184,10 @@ def optimize_merge_inter_calls(
 ) -> pd.DataFrame:
     """Merge abutting reciprocal corner calls into mid×mid exchange events.
 
-    ponytail: geometry merge only (no ILP). Ceiling = conflicting multi-events
-    on the same arm; upgrade = pulp like intra clear-insert if that appears.
+    Like intra clear-insert: only collapse same-event corner geometry. Both arms
+    must abut to link; multi-locus segments on an arm stay separate calls.
+    ponytail: geometry only (no ILP). Ceiling = true corner ambiguity; upgrade
+    = pulp like intra if needed.
     """
     if calls is None or not isinstance(calls, pd.DataFrame) or len(calls) == 0:
         return empty_inter_tra_table()
@@ -1006,44 +1196,23 @@ def optimize_merge_inter_calls(
     for idxs in _connected_call_components(calls.reset_index(drop=True), slack=abut_bp):
         sub = calls.reset_index(drop=True).loc[idxs].copy()
         if len(sub) == 1:
-            r = sub.iloc[0]
-            rows.append(
-                {
-                    "chrom_a": str(r["chrom_a"]),
-                    "start_a": int(r["start_a"]),
-                    "end_a": int(r["end_a"]),
-                    "chrom_b": str(r["chrom_b"]),
-                    "start_b": int(r["start_b"]),
-                    "end_b": int(r["end_b"]),
-                    "size_a": int(r["end_a"]) - int(r["start_a"]),
-                    "size_b": int(r["end_b"]) - int(r["start_b"]),
-                    "n_members": int(r["n_members"])
-                    if "n_members" in sub.columns
-                    else 1,
-                    "n_source_calls": 1,
-                    "source_cluster_ids": str(int(r["cluster_id"])),
-                    "scale_support": int(r["scale_support"]),
-                    "resolutions": str(r["resolutions"]),
-                    "gammas": str(r["gammas"]),
-                    "member_resolutions": str(r["member_resolutions"])
-                    if "member_resolutions" in sub.columns
-                    else "",
-                    "merged_reciprocal": 0,
-                    "enrichment_fold": float(r["enrichment_fold"]),
-                    "enrichment_fold_block": float(
-                        r["enrichment_fold_block"]
-                        if "enrichment_fold_block" in sub.columns
-                        else r["enrichment_fold"]
-                    ),
-                    "enrichment_fold_flank": float(
-                        r["enrichment_fold_flank"]
-                        if "enrichment_fold_flank" in sub.columns
-                        else r["enrichment_fold"]
-                    ),
-                }
-            )
-        else:
-            rows.append(_reconstruct_reciprocal_event(sub))
+            rows.append(_singleton_call_row(sub.iloc[0]))
+            continue
+        segs_a = collapse_overlapping_intervals(
+            [(int(r.start_a), int(r.end_a)) for _, r in sub.iterrows()]
+        )
+        segs_b = collapse_overlapping_intervals(
+            [(int(r.start_b), int(r.end_b)) for _, r in sub.iterrows()]
+        )
+        # independent loci on either arm → keep members (do not span-gap merge)
+        if not (
+            _segs_form_abut_chain(segs_a, abut_bp)
+            and _segs_form_abut_chain(segs_b, abut_bp)
+        ):
+            for _, r in sub.iterrows():
+                rows.append(_singleton_call_row(r))
+            continue
+        rows.append(_reconstruct_reciprocal_event(sub))
 
     out = pd.DataFrame(rows)
     if len(out) == 0:
@@ -1398,6 +1567,7 @@ def _run_one_res_gamma(payload: dict) -> dict:
             int(payload["bridge_bp"]),
             n_threads,
             plm_par="balanced",
+            home_peel=bool(payload.get("home_peel", True)),
         )
     except RuntimeError as exc:
         log(f"[WARN] skip scale: {exc}")
@@ -1410,7 +1580,10 @@ def _run_one_res_gamma(payload: dict) -> dict:
             "log": "\n".join(log_lines),
         }
 
-    log(f"[INFO] graph={nodes}/{edges} shared-community candidates={len(cands)}")
+    log(
+        f"[INFO] graph={nodes}/{edges} shared-community candidates={len(cands)}"
+        f" home_peel={bool(payload.get('home_peel', True))}"
+    )
     if cands.empty:
         return {
             "resolution": res,
@@ -1534,9 +1707,10 @@ def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
     else:
         n_threads = max(1, (os.cpu_count() or 4) // max(1, n_jobs))
 
+    home_peel = not bool(getattr(args, "no_home_peel", False))
     print(
         f"[INFO] pairs={len(pairs)} resolutions={use_resolutions} gammas={gammas} "
-        f"jobs={n_jobs} threads/worker={n_threads}",
+        f"jobs={n_jobs} threads/worker={n_threads} home_peel={home_peel}",
         flush=True,
     )
 
@@ -1565,6 +1739,7 @@ def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
                         "skip_enrichment": bool(args.skip_enrichment),
                         "tip_window_bp": int(args.tip_window_bp),
                         "write_scale_dirs": bool(args.write_scale_dirs),
+                        "home_peel": home_peel,
                     }
                 )
 
@@ -1805,6 +1980,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip reciprocal corner-call optimize-merge after enrichment gate",
     )
     ap.add_argument(
+        "--no-home-peel",
+        action="store_true",
+        help="disable home-peel+restore; dump all shared labels (legacy)",
+    )
+    ap.add_argument(
         "--optimize-abut-bp",
         type=int,
         default=500_000,
@@ -1847,6 +2027,7 @@ def main(argv: list[str] | None = None) -> pd.DataFrame:
         f"  tip-window-bp       = {args.tip_window_bp}\n"
         f"  optimize-merge      = {not args.skip_optimize_merge}\n"
         f"  optimize-abut-bp    = {args.optimize_abut_bp}\n"
+        f"  home-peel           = {not args.no_home_peel}\n"
         f"  compact             = {args.compact}\n"
         f"  write-scale-dirs    = {args.write_scale_dirs}\n"
         f"  outdir              = {args.outdir}",
@@ -1876,6 +2057,7 @@ def _self_check() -> None:
         size_b=500_000,
         min_segment_bp=100_000,
         bridge_bp=0,
+        home_peel=True,
     )
     assert len(cands) == 1, cands
     assert int(cands.iloc[0]["label"]) == 7
@@ -1883,6 +2065,38 @@ def _self_check() -> None:
     assert int(cands.iloc[0]["end_a"]) == 300_000
     assert int(cands.iloc[0]["start_b"]) == 200_000
     assert int(cands.iloc[0]["end_b"]) == 400_000
+
+    # home + two shared sizes: peel small (8) before large (9)
+    labels_a2 = np.array([0] * 10 + [8] * 2 + [9] * 5, dtype=np.int64)
+    labels_b2 = np.array([1] * 8 + [8] * 2 + [9] * 6, dtype=np.int64)
+    labels2 = np.concatenate([labels_a2, labels_b2])
+    peeled = detect_inter_candidates(
+        labels2,
+        n_a=len(labels_a2),
+        resolution=100_000,
+        gamma=1.0,
+        chrom_a="chrA",
+        chrom_b="chrB",
+        size_a=len(labels_a2) * 100_000,
+        size_b=len(labels_b2) * 100_000,
+        min_segment_bp=100_000,
+        bridge_bp=0,
+        home_peel=True,
+    )
+    assert len(peeled) == 2, peeled
+    assert list(peeled["label"].astype(int)) == [8, 9], peeled
+    assert int(peeled.iloc[0]["peel_order"]) == 1
+    assert int(peeled.iloc[1]["peel_order"]) == 2
+    assert int(peeled.iloc[0]["home_a"]) == 0
+    assert int(peeled.iloc[0]["home_b"]) == 1
+    # after restore peel, intervals still reflect pre-restore block sizes
+    assert int(peeled.iloc[0]["length_a_bp"]) == 200_000
+    assert int(peeled.iloc[1]["length_a_bp"]) == 500_000
+    home_a, home_b = pick_home_labels(
+        _largest_block_per_label(labels_a2, 100_000, len(labels_a2) * 100_000, 2, 0),
+        _largest_block_per_label(labels_b2, 100_000, len(labels_b2) * 100_000, 2, 0),
+    )
+    assert home_a == 0 and home_b == 1
     tips = _interval_tips(0, 5_000_000, 2_000_000)
     assert tips == [(0, 2_000_000), (3_000_000, 5_000_000)]
     assert _pair_merge_score(
@@ -1978,6 +2192,53 @@ def _self_check() -> None:
     assert int(opt.iloc[0]["end_a"]) == 66_500_000
     assert int(opt.iloc[0]["start_b"]) == 797_000_000
     assert int(opt.iloc[0]["end_b"]) == 835_500_000
+
+    # two independent events: A overlaps (fat) but B far apart → must stay 2
+    multi = pd.DataFrame(
+        [
+            {
+                "cluster_id": 1,
+                "chrom_a": "A",
+                "start_a": 3_000_000,
+                "end_a": 140_000_000,
+                "chrom_b": "B",
+                "start_b": 660_000_000,
+                "end_b": 796_000_000,
+                "enrichment_fold": 50.0,
+                "enrichment_fold_block": 10.0,
+                "enrichment_fold_flank": 5.0,
+                "scale_support": 5,
+                "resolutions": "50000",
+                "gammas": "1",
+                "member_resolutions": "",
+                "n_members": 5,
+                "size_a": 137_000_000,
+                "size_b": 136_000_000,
+            },
+            {
+                "cluster_id": 2,
+                "chrom_a": "A",
+                "start_a": 100_000_000,
+                "end_a": 250_000_000,
+                "chrom_b": "B",
+                "start_b": 13_000_000,
+                "end_b": 16_000_000,
+                "enrichment_fold": 40.0,
+                "enrichment_fold_block": 8.0,
+                "enrichment_fold_flank": 4.0,
+                "scale_support": 4,
+                "resolutions": "50000",
+                "gammas": "1",
+                "member_resolutions": "",
+                "n_members": 4,
+                "size_a": 150_000_000,
+                "size_b": 3_000_000,
+            },
+        ]
+    )
+    opt2 = optimize_merge_inter_calls(multi, mcool=None, rescore=False)
+    assert len(opt2) == 2, opt2
+    assert int(opt2["merged_reciprocal"].sum()) == 0
     print("[self-check] ok")
 
 
