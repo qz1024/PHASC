@@ -16,8 +16,37 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
+
+
+def _fmt_duration(sec: float) -> str:
+    """Human-readable wall time, e.g. '14m 49s (889 s)'."""
+    total = max(0, int(round(float(sec))))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        pretty = f"{h}h {m}m {s}s"
+    elif m:
+        pretty = f"{m}m {s}s"
+    else:
+        pretty = f"{s}s"
+    return f"{pretty} ({total} s)"
+
+
+assert _fmt_duration(889) == "14m 49s (889 s)"
+assert _fmt_duration(3661) == "1h 1m 1s (3661 s)"
+
+
+def _fmt_score(val) -> str:
+    if val is None:
+        return "NA"
+    try:
+        return f"{float(val):.4f}"
+    except (TypeError, ValueError):
+        return "NA"
 
 
 def _stream_output(pipe, prefix: str) -> None:
@@ -61,37 +90,76 @@ def _promote(src: Path, dst: Path) -> None:
     shutil.move(str(src), str(dst))
 
 
-def _promote_inversion(work: Path, outdir: Path) -> list[str]:
-    promoted: list[str] = []
-    for name in ("ALL_INV_multiscale.tsv", "HiC_images", "HiC_images_flipped"):
-        src = work / name
-        if src.exists():
-            _promote(src, outdir / name)
-            promoted.append(name)
-    return promoted
+def _promote_inv_plots(work: Path, outdir: Path) -> list[str]:
+    """Keep only flipped INV panels, renamed HiC_INV_Plot (drop HiC_images)."""
+    src = work / "HiC_images_flipped"
+    if not src.exists():
+        return []
+    _promote(src, outdir / "HiC_INV_Plot")
+    return ["HiC_INV_Plot"]
 
 
-def _promote_intra_translocation(work: Path, outdir: Path) -> list[str]:
-    """Promote a single-chromosome TRA workdir (legacy path)."""
-    promoted: list[str] = []
-    names = (
-        "ALL_TRA.tsv",
-        "ALL_TRA_pre_enrichment.tsv",
-        "ALL_TRA_enrichment_dropped.tsv",
-        "merged_true_calls.tsv",
-        "ALL_TRA_per_scale_candidates.tsv",
-        "per_resolution_summary.tsv",
-        "mutual_dropped_all.tsv",
-        "mutual_pairs_all.tsv",
-        "community",
-        "HiC",
-    )
-    for name in names:
-        src = work / name
+def _collect_tra_plots(chrom_works: dict[str, Path], outdir: Path) -> list[str]:
+    """Gather TRA plots into HiC_TRA_Plot/: <chrom>/community/ + HiC_TRA_Local/."""
+    dest_root = outdir / "HiC_TRA_Plot"
+    if dest_root.exists():
+        shutil.rmtree(dest_root)
+    local_root = dest_root / "HiC_TRA_Local"
+    n = 0
+    for chrom, work in chrom_works.items():
+        src = work / "community"
         if src.exists():
-            _promote(src, outdir / name)
-            promoted.append(name)
-    return promoted
+            dest = dest_root / chrom / "community"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(src, dest)
+            n += 1
+        # event plots: flat under HiC_TRA_Plot/HiC_TRA_Local/ (not under chrom/)
+        src_local = work / "HiC_TRA_Local"
+        if src_local.exists():
+            local_root.mkdir(parents=True, exist_ok=True)
+            for png in sorted(src_local.glob("*.png")):
+                shutil.copy2(png, local_root / png.name)
+                n += 1
+    if n == 0:
+        return []
+    return ["HiC_TRA_Plot"]
+
+
+def _merge_tra_tables(
+    chrom_works: dict[str, Path],
+    out_tsv: Path,
+    tra_mcool: Path | None = None,
+) -> Path | None:
+    """Merge per-chrom ALL_TRA; shorter reciprocal arm + internal-signal gate."""
+    paths = []
+    for work in chrom_works.values():
+        for name in ("ALL_TRA.tsv", "merged_true_calls.tsv"):
+            p = work / name
+            if p.is_file():
+                paths.append(p)
+                break
+    if not paths:
+        return None
+    if not _merge_tsv_files(paths, out_tsv):
+        return None
+    try:
+        import pandas as pd
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from multiscale_intra_translocation import (
+            filter_tra_weak_internal,
+            keep_shorter_reciprocal_tra,
+        )
+
+        df = pd.read_csv(out_tsv, sep="\t")
+        if len(df):
+            df2 = keep_shorter_reciprocal_tra(df)
+            if tra_mcool is not None:
+                df2 = filter_tra_weak_internal(df2, tra_mcool)
+            df2.to_csv(out_tsv, sep="\t", index=False)
+    except Exception as exc:  # noqa: BLE001 — detection already succeeded
+        print(f"[WARN] TRA post-filters skipped: {exc}", flush=True)
+    return out_tsv
 
 
 def _read_tsv(path: Path):
@@ -122,59 +190,18 @@ def _merge_tsv_files(paths: list[Path], out: Path) -> bool:
     return True
 
 
-def _merge_tra_chromosome_results(
-    chrom_works: dict[str, Path], outdir: Path
-) -> list[str]:
-    """Move per-chrom TRA dirs under outdir/tra_by_chrom and merge top-level TSVs."""
-    promoted: list[str] = []
-    tra_by_chrom = outdir / "tra_by_chrom"
-    if tra_by_chrom.exists():
-        shutil.rmtree(tra_by_chrom)
-    tra_by_chrom.mkdir(parents=True, exist_ok=True)
-
-    table_names = (
-        "ALL_TRA.tsv",
-        "ALL_TRA_pre_enrichment.tsv",
-        "ALL_TRA_enrichment_dropped.tsv",
-        "merged_true_calls.tsv",
-        "ALL_TRA_per_scale_candidates.tsv",
-        "per_resolution_summary.tsv",
-        "mutual_dropped_all.tsv",
-        "mutual_pairs_all.tsv",
-    )
-
-    for chrom, work in chrom_works.items():
-        dest = tra_by_chrom / chrom
-        if work.exists():
-            _promote(work, dest)
-            promoted.append(f"tra_by_chrom/{chrom}")
-
-    for name in table_names:
-        paths = [
-            tra_by_chrom / chrom / name
-            for chrom in chrom_works
-            if (tra_by_chrom / chrom / name).is_file()
-        ]
-        if _merge_tsv_files(paths, outdir / name):
-            promoted.append(name)
-
-    # Prefer ALL_TRA.tsv; fall back to merged_true_calls if needed
-    all_tra = outdir / "ALL_TRA.tsv"
-    merged_true = outdir / "merged_true_calls.tsv"
-    if not all_tra.exists() and merged_true.exists():
-        shutil.copy2(merged_true, all_tra)
-        promoted.append("ALL_TRA.tsv")
-
-    return promoted
-
-
-def _merge_sv_tables(outdir: Path) -> Path | None:
+def _merge_sv_tables(
+    outdir: Path,
+    *,
+    inv_tsv: Path | None,
+    tra_tsv: Path | None,
+) -> Path | None:
     """Write a combined ALL_SV.tsv with sv_type=INV/TRA and shared locus columns."""
     import pandas as pd
 
     frames: list[pd.DataFrame] = []
 
-    inv = _read_tsv(outdir / "ALL_INV_multiscale.tsv")
+    inv = _read_tsv(inv_tsv) if inv_tsv else pd.DataFrame()
     if not inv.empty:
         start = inv["full_start"] if "full_start" in inv.columns else inv.get("start")
         end = inv["full_end"] if "full_end" in inv.columns else inv.get("end")
@@ -198,27 +225,23 @@ def _merge_sv_tables(outdir: Path) -> Path | None:
                     if "scale_support" in inv.columns
                     else pd.NA
                 ),
-                "source_file": "ALL_INV_multiscale.tsv",
             }
         )
         for col in (
-            "core_start",
-            "core_end",
-            "representative_resolution",
-            "max_signal",
-            "left_scale_support",
-            "right_scale_support",
             "scale_support",
             "resolutions",
             "event_score",
+            "left_rho",
+            "right_rho",
+            "flip_improve",
+            "flip_pos_scales",
+            "cluster_id",
         ):
             if col in inv.columns:
                 row[col] = inv[col].values
         frames.append(row)
 
-    tra = _read_tsv(outdir / "ALL_TRA.tsv")
-    if tra.empty:
-        tra = _read_tsv(outdir / "merged_true_calls.tsv")
+    tra = _read_tsv(tra_tsv) if tra_tsv else pd.DataFrame()
     if not tra.empty:
         if "size" not in tra.columns and {"start", "end"} <= set(tra.columns):
             tra = tra.copy()
@@ -238,7 +261,6 @@ def _merge_sv_tables(outdir: Path) -> Path | None:
                 "end": tra["end"] if "end" in tra.columns else pd.NA,
                 "size": tra["size"] if "size" in tra.columns else pd.NA,
                 "call_support": support,
-                "source_file": "ALL_TRA.tsv",
             }
         )
         for col in (
@@ -271,6 +293,73 @@ def _merge_sv_tables(outdir: Path) -> Path | None:
     out = outdir / "ALL_SV.tsv"
     merged.to_csv(out, sep="\t", index=False)
     return out
+
+
+def _write_final_report(
+    outdir: Path,
+    *,
+    start_epoch: float,
+    wall_sec: float,
+    inv_mcool: Path,
+    tra_mcool: Path,
+    summary: dict | None,
+    n_inv: int,
+    n_tra: int,
+    jobs: int,
+    chrom_jobs: int,
+    chromosomes: list[str],
+) -> Path:
+    """Merged runtime + scores -> phasc_final_report.txt (replaces report/runtime)."""
+    scores = (summary or {}).get("component_scores_0_100") or {}
+    inv_score = scores.get("inversion_score")
+    tra_score = scores.get("translocation_score")
+    total = (summary or {}).get("total_score_0_100")
+    start_dt = datetime.fromtimestamp(start_epoch).astimezone()
+    end_dt = datetime.fromtimestamp(start_epoch + wall_sec).astimezone()
+    n_chrom = len(chromosomes)
+    chrom_preview = ", ".join(chromosomes)
+    if len(chrom_preview) > 200:
+        chrom_preview = ", ".join(chromosomes[:12]) + f", ... ({n_chrom} total)"
+
+    lines = [
+        "PHASC final report",
+        "==================",
+        "",
+        "[Runtime]",
+        f"start:     {start_dt.isoformat(timespec='seconds')}",
+        f"end:       {end_dt.isoformat(timespec='seconds')}",
+        f"wall_time: {_fmt_duration(wall_sec)}",
+        "note:      INV and per-chromosome TRA run in parallel; wall_time is total elapsed.",
+        "",
+        "[Inputs]",
+        f"inv_mcool:    {inv_mcool}",
+        f"tra_mcool:    {tra_mcool}",
+        f"chromosomes:  {n_chrom} ({chrom_preview})",
+        f"jobs:         {jobs}  (INV / per-chrom inner workers)",
+        f"chrom_jobs:   {chrom_jobs}  (TRA chromosomes in parallel)",
+        "",
+        "[Results]",
+        f"n_inv:                 {n_inv}",
+        f"n_tra:                 {n_tra}",
+        f"inversion_score:       {_fmt_score(inv_score)}",
+        f"translocation_score:   {_fmt_score(tra_score)}",
+        f"HiC_SCI:               {_fmt_score(total)}",
+        "",
+        "[Outputs]",
+        "ALL_SV.tsv",
+        "HiC_INV_Plot/",
+        "HiC_TRA_Plot/<chrom>/community/   # whole-chromosome community plots",
+        "HiC_TRA_Plot/HiC_TRA_Local/       # detected TRA: community + Hi-C on one figure",
+        "phasc_final_report.txt",
+    ]
+    path = outdir / "phasc_final_report.txt"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # drop legacy split reports if present
+    for legacy in ("report.txt", "runtime.txt"):
+        p = outdir / legacy
+        if p.is_file():
+            p.unlink(missing_ok=True)
+    return path
 
 
 def _chroms_from_mcool(mcool: Path) -> list[str]:
@@ -433,8 +522,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tra-skip-plot",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="skip TRA community plots (default: --tra-skip-plot)",
+        default=False,
+        help="skip TRA community/HiC plots (default: plots on; --tra-skip-plot to disable)",
     )
     parser.add_argument(
         "--tra-resolutions",
@@ -483,14 +572,14 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "after INV/TRA, write HiC-SCI from call tables into outdir/SCI "
-            "(default: --evaluate; uses ALL_INV/ALL_TRA, no re-detection)"
+            "after INV/TRA, score HiC-SCI into phasc_final_report.txt "
+            "(default: --evaluate; no SCI/ folder)"
         ),
     )
     parser.add_argument(
         "--evaluate-penalty-scale",
-        default="25,12",
-        help="evaluate --penalty-scale inv,tra (default: 25,12)",
+        default="5000,500",
+        help="evaluate --penalty-scale inv,tra (default: 5000,500)",
     )
     return parser
 
@@ -541,6 +630,7 @@ def main(argv: list[str] | None = None) -> int:
     inv_work.mkdir(parents=True)
     tra_root.mkdir(parents=True)
     outdir.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
 
     chroms = _resolve_chromosomes(args, tra_mcool)
     n_chroms = len(chroms)
@@ -646,58 +736,100 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 1
 
+    # Final layout: ALL_SV.tsv + phasc_final_report.txt + HiC_INV_Plot/ + HiC_TRA_Plot/
     promoted: list[str] = []
-    promoted.extend(_promote_inversion(inv_work, outdir))
-    if n_chroms == 1:
-        only = next(iter(chrom_works.values()))
-        promoted.extend(_promote_intra_translocation(only, outdir))
-        all_tra = outdir / "ALL_TRA.tsv"
-        merged_true = outdir / "merged_true_calls.tsv"
-        if not all_tra.exists() and merged_true.exists():
-            shutil.copy2(merged_true, all_tra)
-            promoted.append("ALL_TRA.tsv")
-    else:
-        promoted.extend(_merge_tra_chromosome_results(chrom_works, outdir))
+    inv_tsv = inv_work / "ALL_INV_multiscale.tsv"
+    if not inv_tsv.is_file():
+        inv_tsv = None
+    tra_tsv = work_root / "ALL_TRA.merged.tsv"
+    if not _merge_tra_tables(chrom_works, tra_tsv, tra_mcool=tra_mcool):
+        tra_tsv = None
 
-    combined = _merge_sv_tables(outdir)
+    combined = _merge_sv_tables(outdir, inv_tsv=inv_tsv, tra_tsv=tra_tsv)
     if combined is not None:
         promoted.append(combined.name)
-        print(f"[DONE] combined SV table -> {combined}", flush=True)
+        print(f"[DONE] ALL_SV.tsv -> {combined}", flush=True)
 
+    promoted.extend(_promote_inv_plots(inv_work, outdir))
+    promoted.extend(_collect_tra_plots(chrom_works, outdir))
+
+    summary = None
+    n_inv = int(len(_read_tsv(inv_tsv))) if inv_tsv else 0
+    n_tra = int(len(_read_tsv(tra_tsv))) if tra_tsv else 0
     if args.evaluate:
         try:
-            # Lazy import: evaluate pulls cooler/networkx; only needed here.
             sys.path.insert(0, str(base_dir))
             from evaluate import score_sci_from_calls
 
-            sci_dir = outdir / "SCI"
+            # Score into a throwaway dir; phasc_final_report.txt is user-facing.
+            sci_tmp = work_root / "_sci_tmp"
             chrom_list = chroms if args.chromosomes else None
             summary = score_sci_from_calls(
                 mcool=str(inv_mcool),
                 calls_dir=outdir,
-                sci_outdir=sci_dir,
+                sci_outdir=sci_tmp,
+                inv_tsv=inv_tsv,
+                tra_tsv=tra_tsv,
                 penalty_scale=args.evaluate_penalty_scale,
                 chromosomes=chrom_list,
             )
-            promoted.append("SCI")
             print(
                 f"[DONE] HiC-SCI={summary.get('total_score_0_100')} "
                 f"(INV={summary.get('component_scores_0_100', {}).get('inversion_score')}, "
-                f"TRA={summary.get('component_scores_0_100', {}).get('translocation_score')}) "
-                f"-> {sci_dir}",
+                f"TRA={summary.get('component_scores_0_100', {}).get('translocation_score')})",
                 flush=True,
             )
         except Exception as exc:  # noqa: BLE001 — detection already succeeded
             print(f"[WARN] evaluate scoring skipped: {exc}", flush=True)
+
+    report = _write_final_report(
+        outdir,
+        start_epoch=t0,
+        wall_sec=time.time() - t0,
+        inv_mcool=inv_mcool,
+        tra_mcool=tra_mcool,
+        summary=summary,
+        n_inv=n_inv,
+        n_tra=n_tra,
+        jobs=int(args.jobs),
+        chrom_jobs=int(chrom_jobs),
+        chromosomes=list(chroms),
+    )
+    promoted.append(report.name)
+    print(f"[DONE] report -> {report}", flush=True)
+
+    # Drop leftover audit tables if any prior run left them in outdir.
+    for junk in (
+        "ALL_INV_multiscale.tsv",
+        "ALL_TRA.tsv",
+        "ALL_TRA_pre_enrichment.tsv",
+        "ALL_TRA_enrichment_dropped.tsv",
+        "ALL_TRA_per_scale_candidates.tsv",
+        "merged_true_calls.tsv",
+        "mutual_dropped_all.tsv",
+        "mutual_pairs_all.tsv",
+        "per_resolution_summary.tsv",
+        "HiC_images",
+        "HiC_images_flipped",
+        "SCI",
+        "tra_by_chrom",
+        "runtime.txt",
+        "report.txt",
+    ):
+        p = outdir / junk
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+        elif p.is_file():
+            p.unlink(missing_ok=True)
 
     if not args.keep_work:
         shutil.rmtree(work_root, ignore_errors=True)
 
     print(f"[DONE] pipeline results -> {outdir}", flush=True)
     if promoted:
-        print("[DONE] promoted: " + ", ".join(promoted), flush=True)
+        print("[DONE] kept: " + ", ".join(promoted), flush=True)
     else:
-        print("[WARN] no result artifacts found to promote", flush=True)
+        print("[WARN] no result artifacts found", flush=True)
     return 0
 
 

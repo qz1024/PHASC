@@ -379,8 +379,30 @@ def parse_args():
         type=int,
         default=2,
         help=(
-            "post-merge: require this many resolutions with flipΔ > "
-            "--flip_improve_min (default: 2). Flanks are |S| on each side."
+            "post-merge flip gate (50/100/200 kb only): require this many "
+            "scales with flipΔ > --flip_improve_min AND mean flipΔ > "
+            "--flip_improve_min (default: 2). 500 kb is ignored."
+        )
+    )
+
+
+    parser.add_argument(
+        "--flank_outlier_pct",
+        type=float,
+        default=99.0,
+        help=(
+            "before flipΔ/GCOR: percentile for same-distance flank×S "
+            "outlier thr (default: 99; <=0 disables). Final thr = "
+            "flank_outlier_mult × P{pct}."
+        )
+    )
+    parser.add_argument(
+        "--flank_outlier_mult",
+        type=float,
+        default=2.0,
+        help=(
+            "multiply same-distance P{pct} for flank×S NaN mask "
+            "(default: 2 → 2×P99; <=0 disables)."
         )
     )
 
@@ -466,10 +488,10 @@ def parse_args():
     parser.add_argument(
         "--tip_anti_diag_min",
         type=float,
-        default=3.0,
+        default=1.0,
         help=(
             "chrom-tip oneside: require S×S anti/background >= this "
-            "(Juicebox tip X / bowtie; default: 3; <=0 disables)"
+            "(Juicebox tip X / bowtie; default: 1; <=0 disables)"
         )
     )
 
@@ -2143,13 +2165,15 @@ def filter_low_signal_axes(mat, mean_frac=0.3, min_keep=3):
     Dead / hole strips in flank×S bias Spearman toward false INV votes
     (INV11: four near-zero S columns near 640 Mb → ρ 0.36→0.19).
     mean_frac<=0 disables. If too few axes remain, keep the original mat.
+    NaNs (e.g. P99-masked flank×S outliers) are ignored in means and kept.
     """
     mat=np.asarray(mat,dtype=float)
     if mat.ndim!=2 or mat.size==0 or float(mean_frac)<=0:
         return mat
-    work=np.nan_to_num(mat,nan=0.0)
-    row_m=work.mean(axis=1)
-    col_m=work.mean(axis=0)
+    row_m=np.nanmean(mat,axis=1)
+    col_m=np.nanmean(mat,axis=0)
+    row_m=np.nan_to_num(row_m,nan=0.0)
+    col_m=np.nan_to_num(col_m,nan=0.0)
 
     def _keep(means):
         pos=means[means>0]
@@ -2164,8 +2188,8 @@ def filter_low_signal_axes(mat, mean_frac=0.3, min_keep=3):
     r_keep=_keep(row_m)
     c_keep=_keep(col_m)
     if int(r_keep.sum())<int(min_keep) or int(c_keep.sum())<int(min_keep):
-        return work
-    return work[np.ix_(r_keep,c_keep)]
+        return mat
+    return mat[np.ix_(r_keep,c_keep)]
 
 
 def calculate_direction(
@@ -2872,9 +2896,9 @@ def _rect_distance_decay_rho(mat, side):
 
     Returns Spearman(contact, -dist) ∈ [-1, 1]. Higher → more continuous
     (bright near the junction, dark far away). Bounded; no near/far blow-ups.
+    Non-finite contacts (P99-masked outliers) are excluded.
     """
     mat = np.asarray(mat, dtype=float)
-    mat = np.nan_to_num(mat, nan=0.0)
     if mat.ndim != 2 or min(mat.shape) < 2:
         return float("nan")
     if side not in ("left", "right"):
@@ -2885,7 +2909,12 @@ def _rect_distance_decay_rho(mat, side):
     dist = (nr - 1.0 - rr) + cc
     flat_c = mat.ravel()
     flat_d = dist.ravel()
-    if flat_c.size < 4 or np.all(flat_c == flat_c[0]):
+    ok = np.isfinite(flat_c)
+    if int(ok.sum()) < 4:
+        return float("nan")
+    flat_c = flat_c[ok]
+    flat_d = flat_d[ok]
+    if np.all(flat_c == flat_c[0]):
         return float("nan")
     from scipy.stats import spearmanr
     rho, _ = spearmanr(flat_c, -flat_d)
@@ -2922,6 +2951,177 @@ def junction_continuity_score(
     return float(np.mean(vals))
 
 
+# ponytail: chrom×resolution distance-percentile cache for flank×S NaN mask
+_CHROM_DIST_PCT_CACHE = {}
+
+
+def _distance_percentile_from_pairs(d, vals, n, pct=99.0, value_cap=1024):
+    """
+    Per-distance percentile from (bin-distance, contact) pairs.
+
+    Integer-count histogram: O(nnz + n·V), no full sort. Values above
+    value_cap share the top bin (OK for P99 on raw Hi-C counts).
+    """
+    out = np.full(int(n), np.nan, dtype=float)
+    if d.size == 0 or int(n) < 1:
+        return out
+    V = int(value_cap)
+    iv = np.rint(np.asarray(vals, dtype=float)).astype(np.int64, copy=False)
+    iv = np.clip(iv, 0, V)
+    dd = np.asarray(d, dtype=np.int64)
+    ok = (dd >= 0) & (dd < int(n))
+    if not np.any(ok):
+        return out
+    dd = dd[ok]
+    iv = iv[ok]
+    keys = dd * (V + 1) + iv
+    bc = np.bincount(keys, minlength=int(n) * (V + 1))
+    hist = bc.reshape(int(n), V + 1)
+    tot = hist.sum(axis=1)
+    has = tot > 0
+    if not np.any(has):
+        return out
+    cdf = np.cumsum(hist, axis=1)
+    p = float(pct) / 100.0
+    target = np.ceil(p * tot.astype(float)).astype(np.int64)
+    target = np.clip(target, 1, np.maximum(tot, 1))
+    hit = cdf >= target[:, None]
+    out[has] = np.argmax(hit[has], axis=1).astype(float)
+    return out
+
+
+def chrom_distance_percentile(clr, chrom, pct=99.0, balance=False):
+    """
+    Percentile of contact at each bin-distance on one chromosome (upper tri).
+
+    Cached per cooler URI / chrom / pct / balance. O(nnz) once; then O(1).
+    """
+    uri = str(getattr(clr, "uri", None) or getattr(clr, "filename", id(clr)))
+    key = (uri, str(chrom), float(pct), bool(balance))
+    cached = _CHROM_DIST_PCT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    M = clr.matrix(balance=bool(balance), sparse=True).fetch(chrom).tocoo()
+    n = int(M.shape[0])
+    out = np.full(n, np.nan, dtype=float)
+    if n < 1 or M.nnz < 1:
+        _CHROM_DIST_PCT_CACHE[key] = out
+        return out
+    rows = np.asarray(M.row, dtype=np.int64)
+    cols = np.asarray(M.col, dtype=np.int64)
+    data = np.asarray(M.data, dtype=float)
+    upper = cols >= rows
+    out = _distance_percentile_from_pairs(
+        cols[upper] - rows[upper], data[upper], n, pct=float(pct)
+    )
+    _CHROM_DIST_PCT_CACHE[key] = out
+    return out
+
+
+def distance_percentiles_from_dense(hic, pct=99.0):
+    """Same as chrom_distance_percentile, from dense (nonzero upper only)."""
+    M = np.asarray(hic, dtype=float)
+    n = int(M.shape[0])
+    if n < 1:
+        return np.full(0, np.nan, dtype=float)
+    rows, cols = np.nonzero(M)
+    if rows.size == 0:
+        return np.full(n, np.nan, dtype=float)
+    upper = cols >= rows
+    return _distance_percentile_from_pairs(
+        cols[upper] - rows[upper],
+        M[rows[upper], cols[upper]],
+        n,
+        pct=float(pct),
+    )
+
+
+def flank_outlier_distance_thr(
+    pct=99.0, mult=2.0, clr=None, chrom=None, balance=False, dense=None
+):
+    """
+    Threshold array: mult × same-distance P{pct} (default 2×P99).
+
+    pct<=0 or mult<=0 → None (disabled). Prefer cooler sparse (clr, chrom);
+    dense is a fallback.
+    """
+    if float(pct) <= 0 or float(mult) <= 0:
+        return None
+    if clr is not None and chrom is not None:
+        base = chrom_distance_percentile(
+            clr, chrom, pct=float(pct), balance=balance
+        )
+    elif dense is not None:
+        base = distance_percentiles_from_dense(dense, pct=float(pct))
+    else:
+        return None
+    return np.asarray(base, dtype=float) * float(mult)
+
+
+def mask_flank_xs_outliers_to_nan(
+    local, left_bins, target_bins, right_bins, dist_thr
+):
+    """
+    In local left|S|right matrix: if a flank×S contact is > dist_thr[d]
+    at the same bin-distance, set both triangles to NaN (excluded from
+    flip/GCOR Spearman). Returns (matrix, n_masked).
+    """
+    out = np.asarray(local, dtype=float).copy()
+    if dist_thr is None or len(dist_thr) < 1:
+        return out, 0
+    thr = np.asarray(dist_thr, dtype=float)
+    pairs = []
+    l0, l1 = left_bins
+    s0, s1 = target_bins
+    r0, r1 = right_bins
+    if l1 > l0 and s1 > s0:
+        for i in range(l0, l1):
+            for j in range(s0, s1):
+                pairs.append((i, j))
+    if s1 > s0 and r1 > r0:
+        for i in range(s0, s1):
+            for j in range(r0, r1):
+                pairs.append((i, j))
+    n_mask = 0
+    n_max = int(thr.shape[0])
+    for i, j in pairs:
+        d = abs(int(i) - int(j))
+        if d >= n_max:
+            continue
+        t = thr[d]
+        v = out[i, j]
+        if not np.isfinite(v) or not np.isfinite(t):
+            continue
+        if v > t:
+            out[i, j] = np.nan
+            out[j, i] = np.nan
+            n_mask += 1
+    return out, n_mask
+
+
+def mask_rect_above_distance_thr(mat, row0, col0, dist_thr):
+    """
+    Mask cells in a flank×S (or S×flank) rectangle where contact >
+    dist_thr[|bin_i − bin_j|] → NaN. row0/col0 are chrom bin indices of
+    mat[0,0]. Returns (matrix, n_masked).
+    """
+    out = np.asarray(mat, dtype=float).copy()
+    if dist_thr is None or len(dist_thr) < 1 or out.size == 0:
+        return out, 0
+    thr = np.asarray(dist_thr, dtype=float)
+    nr, nc = out.shape
+    ii = np.arange(nr, dtype=np.int64)[:, None] + int(row0)
+    jj = np.arange(nc, dtype=np.int64)[None, :] + int(col0)
+    d = np.abs(ii - jj)
+    n_max = int(thr.shape[0])
+    ok = d < n_max
+    t = np.full(out.shape, np.nan, dtype=float)
+    t[ok] = thr[d[ok]]
+    hit = np.isfinite(out) & np.isfinite(t) & (out > t)
+    out[hit] = np.nan
+    return out, int(hit.sum())
+
+
 def flip_improvement_score(
     hic, left_span, target, right_span, resolution, band=2
 ):
@@ -2935,6 +3135,7 @@ def flip_improvement_score(
 
     >0: flipping S made junctions more continuous → assembly had S inverted.
     <0: flipping made junctions worse → assembly orientation was already OK.
+    NaN contacts (P99-masked) are kept and skipped by the Spearman.
     """
     res = int(resolution)
     spans = [target]
@@ -2948,8 +3149,8 @@ def flip_improvement_score(
     r1 = w1 // res
     if r1 - r0 < 2:
         return float("nan"), float("nan"), float("nan")
+    # Preserve intentional NaNs (outlier mask); do not zero-fill here.
     local = np.asarray(hic[r0:r1, r0:r1], dtype=float)
-    local = np.nan_to_num(local, nan=0.0)
 
     def _loc(span):
         if span is None:
@@ -3033,7 +3234,14 @@ def tip_telomere_trim_span(
 
 
 def flip_improvement_for_interval(
-    clr, chrom, start, end, balance=False, tip_trim_bp=200_000
+    clr,
+    chrom,
+    start,
+    end,
+    balance=False,
+    tip_trim_bp=200_000,
+    flank_outlier_pct=99.0,
+    flank_outlier_mult=2.0,
 ):
     """
     flipΔ for one cooler resolution with flanks of length |S|.
@@ -3041,6 +3249,10 @@ def flip_improvement_for_interval(
     Fetches only left|S|right (not the whole chrom).
     Chrom-tip calls score on a telomere-trimmed S (default drop 0.2 Mb);
     call coordinates themselves are unchanged by the caller.
+
+    flank_outlier_pct / flank_outlier_mult: set flank×S contacts >
+    mult × chrom same-distance P{pct} to NaN before scoring (default
+    2×P99; pct<=0 or mult<=0 disables). NaNs are excluded from Spearman.
     """
     res = int(getattr(clr, "binsize", None) or clr.info.get("bin-size"))
     chrom_size = int(clr.chromsizes[chrom])
@@ -3058,7 +3270,34 @@ def flip_improvement_for_interval(
         clr.matrix(balance=bool(balance)).fetch((chrom, w0, w1)),
         dtype=float,
     )
+    # Cooler missing → 0; 2×P99 outliers → NaN (kept for scoring skip).
     mat = np.nan_to_num(mat, nan=0.0)
+
+    def _bp_to_bin(bp):
+        return (int(bp) - w0) // res
+
+    thr = flank_outlier_distance_thr(
+        pct=float(flank_outlier_pct),
+        mult=float(flank_outlier_mult),
+        clr=clr,
+        chrom=chrom,
+        balance=balance,
+    )
+    if thr is not None:
+        l_bins = (
+            (_bp_to_bin(left[0]), _bp_to_bin(left[1]))
+            if left is not None
+            else (0, 0)
+        )
+        t_bins = (_bp_to_bin(s0), _bp_to_bin(s1))
+        r_bins = (
+            (_bp_to_bin(right[0]), _bp_to_bin(right[1]))
+            if right is not None
+            else (mat.shape[0], mat.shape[0])
+        )
+        mat, _ = mask_flank_xs_outliers_to_nan(
+            mat, l_bins, t_bins, r_bins, thr
+        )
 
     def _rel(span):
         if span is None:
@@ -3083,6 +3322,8 @@ def evaluate_multires_flip(
     flip_min=0.0,
     balance=False,
     tip_trim_bp=200_000,
+    flank_outlier_pct=99.0,
+    flank_outlier_mult=2.0,
 ):
     """
     Per-resolution flipΔ with flank=|S|.
@@ -3104,6 +3345,8 @@ def evaluate_multires_flip(
                 end,
                 balance=balance,
                 tip_trim_bp=tip_trim_bp,
+                flank_outlier_pct=flank_outlier_pct,
+                flank_outlier_mult=flank_outlier_mult,
             )
         except Exception:
             d = float("nan")
@@ -3118,6 +3361,25 @@ def evaluate_multires_flip(
     return int(n_pos), mean_d, per
 
 
+# Post-merge flip gate only uses these resolutions (ignore 500 kb).
+FLIP_GATE_RESOLUTIONS = (50_000, 100_000, 200_000)
+
+
+def flip_gate_resolutions(resolutions=None):
+    """Intersect requested scales with 50/100/200 kb; fallback to those three."""
+    want = set(FLIP_GATE_RESOLUTIONS)
+    if resolutions is None:
+        return list(FLIP_GATE_RESOLUTIONS)
+    out = [int(r) for r in resolutions if int(r) in want]
+    return out if out else list(FLIP_GATE_RESOLUTIONS)
+
+
+def flip_gate_pass(n_pos, mean_d, flip_min=0.0, min_pos_scales=2):
+    """Keep INV if n_pos >= min_pos_scales AND mean flipΔ > flip_min."""
+    mean_ok = bool(np.isfinite(mean_d) and float(mean_d) > float(flip_min))
+    return bool(int(n_pos) >= int(min_pos_scales) and mean_ok)
+
+
 def apply_post_merge_flip_gate(
     mcool_file,
     calls,
@@ -3126,10 +3388,15 @@ def apply_post_merge_flip_gate(
     min_pos_scales=2,
     balance=False,
     tip_trim_bp=200_000,
+    flank_outlier_pct=99.0,
+    flank_outlier_mult=2.0,
 ):
     """
-    After merge: recompute flipΔ at each resolution (flank=|S|) and keep
-    calls with >= min_pos_scales resolutions where flipΔ > flip_min.
+    After merge: recompute flipΔ at 50/100/200 kb only (flank=|S|) and keep
+    calls with >= min_pos_scales positive scales AND mean flipΔ > flip_min.
+
+    flank_outlier_pct/mult: mult×P{pct}→NaN on flank×S before flipΔ
+    (default 2×P99; pct<=0 or mult<=0 disables). Masked sites excluded.
     """
     if calls is None or getattr(calls, "empty", True):
         return calls
@@ -3138,7 +3405,7 @@ def apply_post_merge_flip_gate(
         out["flip_pos_scales"] = np.nan
         out["flip_pass"] = 1
         return out
-    res_list = [int(r) for r in resolutions]
+    res_list = flip_gate_resolutions(resolutions)
     rows = []
     n_drop = 0
     for _, call in calls.iterrows():
@@ -3154,6 +3421,8 @@ def apply_post_merge_flip_gate(
             flip_min=flip_min,
             balance=balance,
             tip_trim_bp=tip_trim_bp,
+            flank_outlier_pct=flank_outlier_pct,
+            flank_outlier_mult=flank_outlier_mult,
         )
         rec = call.to_dict()
         rec["flip_improve"] = mean_d if np.isfinite(mean_d) else np.nan
@@ -3166,15 +3435,24 @@ def apply_post_merge_flip_gate(
             )
             for r in sorted(per)
         )
-        rec["flip_pass"] = int(n_pos >= int(min_pos_scales))
+        rec["flip_pass"] = int(
+            flip_gate_pass(
+                n_pos,
+                mean_d,
+                flip_min=flip_min,
+                min_pos_scales=min_pos_scales,
+            )
+        )
         if rec["flip_pass"] == 1:
             rows.append(rec)
         else:
             n_drop += 1
+            mean_s = f"{mean_d:+.4f}" if np.isfinite(mean_d) else "NA"
             print(
                 f"[INFO] post-merge flip drop {chrom}:{s0}-{s1} "
-                f"(pos_scales={n_pos}/{len(res_list)} "
-                f"need>={min_pos_scales}; {rec['flip_by_resolution']})",
+                f"(pos_scales={n_pos}/{len(res_list)} @50/100/200kb "
+                f"need>={min_pos_scales}&mean>{flip_min}; "
+                f"mean_flipΔ={mean_s}; {rec['flip_by_resolution']})",
                 flush=True,
             )
     out = pd.DataFrame(rows) if rows else calls.iloc[0:0].copy()
@@ -3186,7 +3464,8 @@ def apply_post_merge_flip_gate(
     print(
         f"[INFO] post-merge flip gate: kept {len(out)} / "
         f"{len(calls)} (dropped {n_drop}; "
-        f"need >={min_pos_scales} scales with flipΔ > {flip_min})",
+        f"50/100/200kb only: >={min_pos_scales} scales with flipΔ > "
+        f"{flip_min} and mean flipΔ > {flip_min})",
         flush=True,
     )
     return out.reset_index(drop=True)
@@ -3207,14 +3486,39 @@ def _flip_improvement_selfcheck():
         inv, left, target, right, 1, band=2
     )
     assert d_inv > 0, (d_inv, b_inv, a_inv)
+    # flank×S outlier > thr → NaN (excluded from Spearman).
+    thr = np.full(n, 2.0, dtype=float)
+    spiked = mat.copy()
+    spiked[5, 25] = 100.0
+    spiked[25, 5] = 100.0
+    masked, n_mask = mask_flank_xs_outliers_to_nan(
+        spiked, (0, 20), (20, 40), (40, 60), thr
+    )
+    assert n_mask >= 1 and np.isnan(masked[5, 25]) and np.isnan(masked[25, 5]), (
+        n_mask, masked[5, 25]
+    )
+    # NaN sites must not drag continuity (masked mat still scores).
+    d_masked, _, _ = flip_improvement_score(
+        masked, left, target, right, 1, band=2
+    )
+    assert np.isfinite(d_masked), d_masked
+    masked0, n0 = mask_flank_xs_outliers_to_nan(
+        spiked, (0, 20), (20, 40), (40, 60), None
+    )
+    assert n0 == 0 and masked0[5, 25] == 100.0
     # Flank length must equal |S| when both sides fit.
     L, R = inversion_flank_spans(100, 150, 1000)
     assert L == [50, 100, 0] and R == [150, 200, 0], (L, R)
     L2, R2 = inversion_flank_spans(0, 50, 1000)
     assert L2 is None and R2 == [50, 100, 0], (L2, R2)
-    # Gate: need two scales with flipΔ > 0.
-    assert sum(1 for d in (0.1, 0.2, -0.1) if d > 0) >= 2
-    assert sum(1 for d in (0.1, -0.2, -0.1) if d > 0) < 2
+    # Gate: >=2 scales with flipΔ > 0 AND mean > 0 (50/100/200 kb only).
+    assert flip_gate_resolutions([50_000, 100_000, 200_000, 500_000]) == [
+        50_000, 100_000, 200_000
+    ]
+    assert flip_gate_pass(2, 0.05, flip_min=0.0, min_pos_scales=2)
+    assert not flip_gate_pass(2, -0.05, flip_min=0.0, min_pos_scales=2)
+    assert not flip_gate_pass(1, 0.05, flip_min=0.0, min_pos_scales=2)
+    assert not flip_gate_pass(3, -0.05, flip_min=0.0, min_pos_scales=2)
     # Tip telomere trim: score span shrinks; call coords stay caller's job.
     cs = 100_000_000
     assert tip_telomere_trim_span(
@@ -3544,14 +3848,27 @@ def detect_block_INV(
         # Drop GAP bins inside Left×S / S×Right so white bands do not
         # flatten Spearman orientation (same mask as Louvain clustering).
         # Tip scoring uses gcor_target (telomere-trimmed S).
+        # P99 outliers → NaN so they do not enter GCOR axis means / ρ.
+        dist_thr=getattr(args,"chrom_dist_pct",None)
+        res_i=int(args.res)
         left_matrix=None
         right_matrix=None
         if need_left:
-            left_parts=[
-                get_block_matrix(hic, block, gcor_target, args.res, gap_mask)
-                for block in left_blocks
-            ]
-            left_parts=[p for p in left_parts if p.size]
+            left_parts=[]
+            for block in left_blocks:
+                p=get_block_matrix(
+                    hic, block, gcor_target, args.res, gap_mask
+                )
+                if not p.size:
+                    continue
+                if dist_thr is not None:
+                    p,_=mask_rect_above_distance_thr(
+                        p,
+                        int(block[0])//res_i,
+                        int(gcor_target[0])//res_i,
+                        dist_thr,
+                    )
+                left_parts.append(p)
             if not left_parts:
                 scale_records.append({
                     "fraction":float(frac),
@@ -3562,11 +3879,21 @@ def detect_block_INV(
                 continue
             left_matrix=np.vstack(left_parts)
         if need_right:
-            right_parts=[
-                get_block_matrix(hic, gcor_target, block, args.res, gap_mask)
-                for block in right_blocks
-            ]
-            right_parts=[p for p in right_parts if p.size]
+            right_parts=[]
+            for block in right_blocks:
+                p=get_block_matrix(
+                    hic, gcor_target, block, args.res, gap_mask
+                )
+                if not p.size:
+                    continue
+                if dist_thr is not None:
+                    p,_=mask_rect_above_distance_thr(
+                        p,
+                        int(gcor_target[0])//res_i,
+                        int(block[0])//res_i,
+                        dist_thr,
+                    )
+                right_parts.append(p)
             if not right_parts:
                 scale_records.append({
                     "fraction":float(frac),
@@ -3869,11 +4196,11 @@ def detect_block_INV(
     small_max=int(getattr(args, "small_inv_max_size", 1_000_000))
     is_small=small_max>0 and int(call_size)<=small_max
     # Anti-diag gate:
-    #   tip oneside — require S×S anti/bg (Juicebox X); default tip_anti_diag_min=3
+    #   tip oneside — require S×S anti/bg (Juicebox X); default tip_anti_diag_min=1
     #   small internal — small_s_anti_diag_min (noisy short calls)
     anti_min=0.0
     if edge_oneside is not None:
-        anti_min=float(getattr(args, "tip_anti_diag_min", 3.0))
+        anti_min=float(getattr(args, "tip_anti_diag_min", 1.0))
     elif is_small:
         anti_min=float(getattr(args, "small_s_anti_diag_min", 2.0))
     band=int(getattr(args, "corner_band_bins", 2))
@@ -4247,7 +4574,7 @@ def diagnose_region(mcool_file, region, res=50_000, balance=False, outdir="diagn
         tip_min_s_occupancy=0.15,
         tip_max_s_gap_frac=0.70,
         tip_allow_nan_corner=True,
-        tip_anti_diag_min=3.0,
+        tip_anti_diag_min=1.0,
         tip_orphan_ratio=0.25,
         oneside_min_size=8_000_000,
         gap_oneside_min_frac=0.10,
@@ -4367,7 +4694,7 @@ def diagnose_region(mcool_file, region, res=50_000, balance=False, outdir="diagn
             f"(anti={anti_m:.3f} diag={diag_m:.3f})"
         )
 
-    print("\n[DIAG] === tip anti-diag gate (default tip_anti_diag_min=3) ===")
+    print("\n[DIAG] === tip anti-diag gate (default tip_anti_diag_min=1) ===")
     print(
         "  Tip oneside requires S×S anti/bg >= tip_anti_diag_min "
         "(Juicebox X). False tips with strong ρR but no bowtie fail anti_pass."
@@ -4416,7 +4743,24 @@ def process_one_chrom(
         nan=0
     )
 
-
+    # Same-distance mult×P{pct} thr for flank×S outlier → NaN in GCOR.
+    # Prefer cooler sparse (nnz) over dense diag walk — wheat 50kb is ~14k².
+    pct=float(getattr(args,"flank_outlier_pct",99.0))
+    mult=float(getattr(args,"flank_outlier_mult",2.0))
+    args.chrom_dist_pct=flank_outlier_distance_thr(
+        pct=pct,
+        mult=mult,
+        clr=clr,
+        chrom=chrom,
+        balance=bool(args.balance),
+    )
+    if args.chrom_dist_pct is not None:
+        print(
+            f"[INFO] {chrom} flank×S {mult:g}×P{pct:g} thr ready "
+            f"(finite distances="
+            f"{int(np.isfinite(args.chrom_dist_pct).sum())})",
+            flush=True,
+        )
 
     ##################################################
     # blocks: Louvain (finest) or lift from finest
@@ -5663,6 +6007,148 @@ def overlap_fraction(a_start,a_end,b_start,b_end):
     return overlap/shorter
 
 
+def _inv_faces_neighbor(left_rho, right_rho, toward):
+    """
+    True if the INV-orientation signal is biased toward ``toward``
+    ('left' or 'right') — typical when a flank sits on a real neighbor INV.
+    """
+    L = float(left_rho) if np.isfinite(left_rho) else 0.0
+    R = float(right_rho) if np.isfinite(right_rho) else 0.0
+    if toward == "right":
+        # right arm wants ρR < 0; FP borrows the neighbor on the right
+        return (R < 0.0) and (
+            abs(R) >= abs(L) + 0.15 or (abs(R) >= 0.5 and abs(L) < 0.5)
+        )
+    if toward == "left":
+        return (L > 0.0) and (
+            abs(L) >= abs(R) + 0.15 or (abs(L) >= 0.5 and abs(R) < 0.5)
+        )
+    raise ValueError("toward must be 'left' or 'right'")
+
+
+def filter_abutting_inv_rivals(calls, max_gap_bp=500_000):
+    """
+    Drop abutting false positives contaminated by a neighboring true INV.
+
+    Same-chrom consecutive calls with 0 ≤ gap < max_gap_bp (default 500 kb):
+    if a call's strong arm faces the neighbor and its flipΔ is weaker, drop
+    it. If both face each other, keep the higher flipΔ.
+
+    XY6 chr7B 271.7–273.35 (weak, faces right) vs 273.4–275.2 (strong):
+    drops the left FP. Balanced both-arm abutting pairs (ZM16) are kept.
+    """
+    if calls is None or getattr(calls, "empty", True) or len(calls) < 2:
+        return calls
+    df = calls.sort_values(["chrom", "start", "end"]).reset_index(drop=True)
+    drop = set()
+    max_gap = int(max_gap_bp)
+
+    def _flip(i):
+        if "flip_improve" not in df.columns:
+            return float("nan")
+        v = pd.to_numeric(df.at[i, "flip_improve"], errors="coerce")
+        return float(v) if np.isfinite(v) else float("nan")
+
+    def _rho(i, col):
+        if col not in df.columns:
+            return 0.0
+        v = pd.to_numeric(df.at[i, col], errors="coerce")
+        return float(v) if np.isfinite(v) else 0.0
+
+    def _weaker(f_self, f_other):
+        if np.isfinite(f_self) and np.isfinite(f_other):
+            return f_self < f_other - 0.02
+        if not np.isfinite(f_self) and np.isfinite(f_other):
+            return True
+        return False
+
+    def _log_drop(idx, why, f_self, f_other):
+        print(
+            f"[INFO] abutting INV rival drop "
+            f"{df.at[idx,'chrom']}:{int(df.at[idx,'start'])}-"
+            f"{int(df.at[idx,'end'])} ({why}, "
+            f"flipΔ={f_self:+.3f} < {f_other:+.3f})",
+            flush=True,
+        )
+
+    for i in range(len(df) - 1):
+        j = i + 1
+        if str(df.at[i, "chrom"]) != str(df.at[j, "chrom"]):
+            continue
+        gap = int(df.at[j, "start"]) - int(df.at[i, "end"])
+        if gap < 0 or gap >= max_gap:
+            continue
+        fa, fb = _flip(i), _flip(j)
+        a_faces = _inv_faces_neighbor(
+            _rho(i, "left_rho"), _rho(i, "right_rho"), "right"
+        )
+        b_faces = _inv_faces_neighbor(
+            _rho(j, "left_rho"), _rho(j, "right_rho"), "left"
+        )
+        if a_faces and b_faces:
+            if _weaker(fa, fb):
+                drop.add(i)
+                _log_drop(i, "faces neighbor", fa, fb)
+            elif _weaker(fb, fa):
+                drop.add(j)
+                _log_drop(j, "faces neighbor", fb, fa)
+        elif a_faces and _weaker(fa, fb):
+            drop.add(i)
+            _log_drop(i, "right arm faces neighbor", fa, fb)
+        elif b_faces and _weaker(fb, fa):
+            drop.add(j)
+            _log_drop(j, "left arm faces neighbor", fb, fa)
+
+    if not drop:
+        return df
+    out = df.drop(index=sorted(drop)).reset_index(drop=True)
+    if "cluster_id" in out.columns:
+        out["cluster_id"] = np.arange(1, len(out) + 1)
+    print(
+        f"[INFO] abutting INV rival filter: kept {len(out)} / {len(df)} "
+        f"(dropped {len(drop)}; max_gap={max_gap})",
+        flush=True,
+    )
+    return out
+
+
+def _abutting_inv_rivals_selfcheck():
+    # XY6-like: left FP faces right, weaker flip → drop left
+    df = pd.DataFrame(
+        [
+            dict(
+                chrom="chr7B", start=271_700_000, end=273_350_000,
+                left_rho=0.36, right_rho=-0.86, flip_improve=0.04,
+                cluster_id=1,
+            ),
+            dict(
+                chrom="chr7B", start=273_400_000, end=275_200_000,
+                left_rho=0.88, right_rho=-0.28, flip_improve=0.19,
+                cluster_id=2,
+            ),
+        ]
+    )
+    out = filter_abutting_inv_rivals(df, max_gap_bp=500_000)
+    assert len(out) == 1 and int(out.iloc[0]["start"]) == 273_400_000, out
+    # ZM16-like both-arm strong abutting → keep both
+    df2 = pd.DataFrame(
+        [
+            dict(
+                chrom="chr7B", start=273_800_000, end=275_450_000,
+                left_rho=0.78, right_rho=-0.84, flip_improve=0.076,
+                cluster_id=1,
+            ),
+            dict(
+                chrom="chr7B", start=275_450_000, end=277_200_000,
+                left_rho=0.90, right_rho=-0.72, flip_improve=0.164,
+                cluster_id=2,
+            ),
+        ]
+    )
+    out2 = filter_abutting_inv_rivals(df2, max_gap_bp=500_000)
+    assert len(out2) == 2, out2
+
+
 def dedup_overlapping_inv_calls(calls, min_ios=0.5):
     """
     Final same-chrom collapse: merge calls with IoS >= min_ios into one span.
@@ -6136,6 +6622,17 @@ def merge_multiscale_results(args):
             min_pos_scales=int(getattr(args,"flip_min_pos_scales",2)),
             balance=bool(getattr(args,"balance",False)),
             tip_trim_bp=int(getattr(args,"tip_telomere_trim_bp",200_000)),
+            flank_outlier_pct=float(
+                getattr(args,"flank_outlier_pct",99.0)
+            ),
+            flank_outlier_mult=float(
+                getattr(args,"flank_outlier_mult",2.0)
+            ),
+        )
+        _abutting_inv_rivals_selfcheck()
+        result=filter_abutting_inv_rivals(
+            result,
+            max_gap_bp=int(getattr(args,"abutting_inv_max_gap_bp",500_000)),
         )
 
 
@@ -6297,10 +6794,10 @@ def parse_workflow_args():
     parser.add_argument(
         "--tip-anti-diag-min",
         type=float,
-        default=3.0,
+        default=1.0,
         help=(
             "chrom-tip oneside: require S×S anti/background >= this "
-            "(Juicebox tip X; default: 3; <=0 disables)"
+            "(Juicebox tip X; default: 1; <=0 disables)"
         )
     )
     parser.add_argument(
@@ -6393,8 +6890,28 @@ def parse_workflow_args():
         type=int,
         default=2,
         help=(
-            "post-merge: require this many resolutions with flipΔ > "
-            "--flip-improve-min (default: 2); flanks are |S| each side"
+            "post-merge flip gate (50/100/200 kb only): require this many "
+            "scales with flipΔ > --flip-improve-min AND mean flipΔ > "
+            "threshold (default: 2). 500 kb is ignored."
+        )
+    )
+    parser.add_argument(
+        "--flank-outlier-pct",
+        type=float,
+        default=99.0,
+        help=(
+            "before flipΔ/GCOR: percentile for same-distance flank×S "
+            "outlier thr (default: 99; <=0 disables). Final thr = "
+            "--flank-outlier-mult × P{pct}."
+        )
+    )
+    parser.add_argument(
+        "--flank-outlier-mult",
+        type=float,
+        default=2.0,
+        help=(
+            "multiply same-distance P{pct} for flank×S NaN mask "
+            "(default: 2 → 2×P99; <=0 disables)"
         )
     )
     parser.add_argument(
@@ -6481,6 +6998,8 @@ def parse_workflow_args():
     args.flip_min_pos_scales=int(args.flip_min_pos_scales)
     if args.flip_min_pos_scales<1:
         parser.error("--flip-min-pos-scales must be >= 1")
+    args.flank_outlier_pct=float(args.flank_outlier_pct)
+    args.flank_outlier_mult=float(args.flank_outlier_mult)
     args.small_inv_max_size=int(args.small_inv_max_size)
     args.small_rho_cutoff=float(args.small_rho_cutoff)
     args.small_s_anti_diag_min=float(args.small_s_anti_diag_min)
@@ -6542,7 +7061,7 @@ def original_detection_command(
         "--max_s_gap_frac","0.25",
         "--tip_min_s_occupancy",str(getattr(args,"tip_min_s_occupancy",0.15)),
         "--tip_max_s_gap_frac",str(getattr(args,"tip_max_s_gap_frac",0.70)),
-        "--tip_anti_diag_min",str(getattr(args,"tip_anti_diag_min",3.0)),
+        "--tip_anti_diag_min",str(getattr(args,"tip_anti_diag_min",1.0)),
         "--tip_orphan_ratio",str(getattr(args,"tip_orphan_ratio",0.25)),
         "--tip_telomere_trim_bp",str(
             getattr(args,"tip_telomere_trim_bp",200_000)
@@ -6566,6 +7085,12 @@ def original_detection_command(
         "--flip_improve_min",str(getattr(args,"flip_improve_min",0.0)),
         "--flip_min_pos_scales",str(
             getattr(args,"flip_min_pos_scales",2)
+        ),
+        "--flank_outlier_pct",str(
+            getattr(args,"flank_outlier_pct",99.0)
+        ),
+        "--flank_outlier_mult",str(
+            getattr(args,"flank_outlier_mult",2.0)
         ),
         "--gcor_strong_arm_min",str(
             getattr(args,"gcor_strong_arm_min",0.5)
@@ -6616,6 +7141,12 @@ def original_merge_command(script,args,merge_inputs,merge_dir):
         "--flip_improve_min",str(getattr(args,"flip_improve_min",0.0)),
         "--flip_min_pos_scales",str(
             getattr(args,"flip_min_pos_scales",2)
+        ),
+        "--flank_outlier_pct",str(
+            getattr(args,"flank_outlier_pct",99.0)
+        ),
+        "--flank_outlier_mult",str(
+            getattr(args,"flank_outlier_mult",2.0)
         ),
         "--tip_telomere_trim_bp",str(
             getattr(args,"tip_telomere_trim_bp",200_000)
@@ -7508,7 +8039,15 @@ def collage_local_inversions(local_dir,out_path,columns=3,pad=12,bg=255):
     return out_path
 
 
-def plot_flipped_inversions(mcool_file,calls,resolutions,image_dir,balance=False):
+def plot_flipped_inversions(
+    mcool_file,
+    calls,
+    resolutions,
+    image_dir,
+    balance=False,
+    flank_outlier_pct=99.0,
+    flank_outlier_mult=2.0,
+):
     """
     Two-row panels per INV: original (top) vs S-flipped (bottom) at each
     detection-scale resolution (typically 50/100/200/500 kb).
@@ -7533,12 +8072,20 @@ def plot_flipped_inversions(mcool_file,calls,resolutions,image_dir,balance=False
         for resolution in want
     }
     base_clr=coolers[want[0]]
+    pct=float(flank_outlier_pct)
+    mult=float(flank_outlier_mult)
 
     def _flip_delta(chrom,s0,s1,res,chrom_size):
         del chrom_size
         try:
             d,_,_=flip_improvement_for_interval(
-                coolers[res],chrom,s0,s1,balance=False
+                coolers[res],
+                chrom,
+                s0,
+                s1,
+                balance=False,
+                flank_outlier_pct=pct,
+                flank_outlier_mult=mult,
             )
             return float(d)
         except Exception:
@@ -7598,7 +8145,7 @@ def plot_flipped_inversions(mcool_file,calls,resolutions,image_dir,balance=False
             f"INV{int(call.cluster_id)} | {chrom}  "
             f"{s0/1e6:.2f}–{s1/1e6:.2f} Mb\n"
             f"ρL={_fmt_rho(left_rho)}  ρR={_fmt_rho(right_rho)}  "
-            f"flipΔ(table)={_fmt_rho(flip_d)}  |  S flipped | "
+            f"mean flipΔ={_fmt_rho(flip_d)}  "
             f"flipΔ({res_ref//1000}kb)={dlt_s}",
             fontsize=11,linespacing=1.25,y=0.995
         )
@@ -7613,7 +8160,15 @@ def plot_flipped_inversions(mcool_file,calls,resolutions,image_dir,balance=False
     return flip_dir
 
 
-def render_hic_images(mcool_file,result,resolutions,outdir,balance=False):
+def render_hic_images(
+    mcool_file,
+    result,
+    resolutions,
+    outdir,
+    balance=False,
+    flank_outlier_pct=99.0,
+    flank_outlier_mult=2.0,
+):
     image_dir=Path(outdir)/"HiC_images"
     image_dir.mkdir(parents=True,exist_ok=True)
     available=available_resolutions(mcool_file)
@@ -7635,6 +8190,8 @@ def render_hic_images(mcool_file,result,resolutions,outdir,balance=False):
         mcool_file,result,resolutions,
         Path(outdir)/"HiC_images_flipped",
         balance=balance,
+        flank_outlier_pct=flank_outlier_pct,
+        flank_outlier_mult=flank_outlier_mult,
     )
     return image_dir
 
@@ -7682,7 +8239,13 @@ def workflow_main():
         print(f"[INFO] plot-only from {tsv} ({len(result)} calls)",flush=True)
         image_dir=render_hic_images(
             args.mcool_file,result,resolutions,outdir,
-            balance=bool(args.balance)
+            balance=bool(args.balance),
+            flank_outlier_pct=float(
+                getattr(args,"flank_outlier_pct",99.0)
+            ),
+            flank_outlier_mult=float(
+                getattr(args,"flank_outlier_mult",2.0)
+            ),
         )
         print(f"[DONE] Hi-C figures -> {image_dir}",flush=True)
         return
@@ -7836,6 +8399,18 @@ def workflow_main():
             min_pos_scales=int(getattr(args,"flip_min_pos_scales",2)),
             balance=bool(getattr(args,"balance",False)),
             tip_trim_bp=int(getattr(args,"tip_telomere_trim_bp",200_000)),
+            flank_outlier_pct=float(
+                getattr(args,"flank_outlier_pct",99.0)
+            ),
+            flank_outlier_mult=float(
+                getattr(args,"flank_outlier_mult",2.0)
+            ),
+        )
+        # Abutting FP: strong arm faces neighbor INV, weaker flipΔ → drop.
+        _abutting_inv_rivals_selfcheck()
+        result=filter_abutting_inv_rivals(
+            result,
+            max_gap_bp=int(getattr(args,"abutting_inv_max_gap_bp",500_000)),
         )
 
     if not result.empty and (args.hic_alignments or args.fasta):
@@ -7874,7 +8449,13 @@ def workflow_main():
                 plot_result[col]=result[col].values
         render_hic_images(
             args.mcool_file,plot_result,resolutions,outdir,
-            balance=bool(args.balance)
+            balance=bool(args.balance),
+            flank_outlier_pct=float(
+                getattr(args,"flank_outlier_pct",99.0)
+            ),
+            flank_outlier_mult=float(
+                getattr(args,"flank_outlier_mult",2.0)
+            ),
         )
     elif bool(getattr(args, "no_plot", False)):
         print("[INFO] --no-plot: skip Hi-C image rendering", flush=True)

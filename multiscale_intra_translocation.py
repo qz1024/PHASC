@@ -10,7 +10,10 @@ Companion to ``multiscale_inter_translocation.py``. Default flow:
   merge across (resolution, gamma)
       - reciprocal overlap or smaller-contained-in-larger
       - if still overlapping, keep higher scale_support (then size)
-  enrichment gate (default): keep enrichment_fold > 1.5  -> ALL_TRA.tsv
+  enrichment gate (default): keep enrichment_fold > 1.5
+  reciprocal mutual-insert: keep shorter arm only
+  internal-signal gate: drop if insert or partner intra mean
+      < (1/3) × mean intra of random equal-length windows -> ALL_TRA.tsv
       - enrichment_fold = max tip×tip O/E near breakpoints
         (obs/E(d) on tip windows; chromosome raw-contact decay)
       - enrichment_fold_block = full cand×partner O/E (audit)
@@ -1061,9 +1064,8 @@ def build_clear_insert_relations(
     """Return (fill triples, mutual_records).
 
     i clearly fills a residual gap between two consecutive *same-label*
-    community pieces. Mutual A<->B (A B C D -> A C B D: both views valid):
-    **report both** inserters (do not drop either). Evaluation treats either
-    (or both) as correct for the same TRA event.
+    community pieces. Mutual A<->B (A B C D -> A C B D: both views valid
+    during ILP); final ALL_TRA keeps only the shorter insert arm.
     """
     merged_blocks = merged_blocks or {}
     fills: list[tuple[int, int, int, int]] = []
@@ -1400,11 +1402,11 @@ def resolve_persistent_mutuals(
     true_tables: dict,
     min_rec: float = 0.5,
 ) -> tuple[pd.DataFrame, int]:
-    """Final pass: ensure *both* sides of mutual-insert pairs are reported.
+    """Recover missing mutual-insert mates into true_tables (pre-merge).
 
-    A B C D -> A C B D: B and C are mutually insertable. Recover any side that
-    never became ``true`` at any scale. Never demote the other side.
-    Returns (recovered_rows, n_demote) with n_demote always 0.
+    A B C D -> A C B D: B and C are mutually insertable. A recovered mate may
+    be added here; ``keep_shorter_reciprocal_tra`` later keeps only the shorter
+    arm in ALL_TRA. Returns (recovered_rows, n_demote) with n_demote always 0.
     """
     empty = pd.DataFrame()
     if not mutual_records:
@@ -1537,7 +1539,8 @@ def annotate_mutual_insert_on_merged(
       mutual_pair_id     shared id for the two sides (0 = not mutual)
       mutual_partner_start / mutual_partner_end  the other side's interval
 
-    Both sides stay in ALL_TRA with equal status (no primary/secondary drop).
+    Both sides may still be present here; ``keep_shorter_reciprocal_tra``
+    drops the longer arm before ALL_TRA is written.
     """
     out = merged.copy()
     n = len(out)
@@ -1603,8 +1606,233 @@ def suppress_mutual_losers_in_true_tables(
     mutual_records: list[dict],
     min_rec: float = 0.5,
 ) -> int:
-    """No-op: mutual-insert pairs are both kept (never demoted)."""
+    """No-op placeholder; final shorter-arm filter is keep_shorter_reciprocal_tra."""
+    del true_tables, mutual_records, min_rec
     return 0
+
+
+def keep_shorter_reciprocal_tra(
+    merged: pd.DataFrame, abut_slack: int = 500_000, *, quiet: bool = False
+) -> pd.DataFrame:
+    """Keep only the shorter insert when reciprocal TRA arms abut / pair.
+
+    A B C D → A C B D yields two mutually embeddable inserts (B and C). Report
+    the shorter arm only; annotate mutual_* from the dropped longer arm.
+    """
+    if merged is None or len(merged) <= 1:
+        return merged if merged is not None else empty_tra_table()
+    groups = group_abutting_tra_calls(merged, abut_slack=abut_slack)
+    # also collapse mutual_pair_id mates that somehow did not abut
+    if "mutual_pair_id" in merged.columns:
+        by_pid: dict[int, list[int]] = {}
+        for gi, g in enumerate(groups):
+            pids = [
+                int(x)
+                for x in g.get("mutual_pair_id", pd.Series(dtype=int)).tolist()
+                if int(x) > 0
+            ]
+            for pid in set(pids):
+                by_pid.setdefault(pid, []).append(gi)
+        parent = list(range(len(groups)))
+
+        def find(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        for idxs in by_pid.values():
+            if len(idxs) < 2:
+                continue
+            root = find(idxs[0])
+            for j in idxs[1:]:
+                parent[find(j)] = root
+        merged_groups: dict[int, pd.DataFrame] = {}
+        for gi, g in enumerate(groups):
+            r = find(gi)
+            if r not in merged_groups:
+                merged_groups[r] = g
+            else:
+                merged_groups[r] = pd.concat(
+                    [merged_groups[r], g], ignore_index=True
+                ).drop_duplicates(
+                    subset=["chrom", "start", "end"], keep="first"
+                )
+        groups = list(merged_groups.values())
+
+    keep_rows: list[pd.Series] = []
+    n_drop = 0
+    for g in groups:
+        if len(g) == 1:
+            keep_rows.append(g.iloc[0])
+            continue
+        gg = g.copy()
+        gg["_sz"] = gg["end"].astype(int) - gg["start"].astype(int)
+        sort_by = ["_sz"]
+        ascending = [True]
+        for col, asc in (("enrichment_fold", False), ("scale_support", False)):
+            if col in gg.columns:
+                sort_by.append(col)
+                ascending.append(asc)
+        gg = gg.sort_values(by=sort_by, ascending=ascending).reset_index(drop=True)
+        winner = gg.iloc[0].drop(labels=["_sz"]).copy()
+        other = gg.iloc[1]
+        winner["mutual_insert"] = 1
+        if int(winner.get("mutual_pair_id", 0) or 0) <= 0:
+            winner["mutual_pair_id"] = 1
+        winner["mutual_partner_start"] = int(other["start"])
+        winner["mutual_partner_end"] = int(other["end"])
+        keep_rows.append(winner)
+        n_drop += len(gg) - 1
+    out = pd.DataFrame(keep_rows).reset_index(drop=True)
+    if len(out) and "cluster_id" in out.columns:
+        out["cluster_id"] = np.arange(1, len(out) + 1, dtype=int)
+    if "_sz" in out.columns:
+        out = out.drop(columns=["_sz"])
+    if n_drop and not quiet:
+        print(
+            f"[INFO] reciprocal TRA: keep shorter arm only "
+            f"(dropped {n_drop} longer mate{'s' if n_drop != 1 else ''})",
+            flush=True,
+        )
+    return out
+
+
+def _interval_internal_mean(
+    clr: cooler.Cooler, chrom: str, start: int, end: int, diag_k: int = 1
+) -> float:
+    """Mean off-diagonal contacts inside [start, end) (exclude near-diag band)."""
+    s, e = int(start), int(end)
+    if e - s < 2 * int(clr.binsize):
+        return float("nan")
+    mat = np.asarray(clr.matrix(balance=False).fetch((chrom, s, e)), dtype=float)
+    n = mat.shape[0]
+    if n < 2:
+        return float("nan")
+    iu = np.triu_indices(n, k=max(1, int(diag_k)))
+    vals = mat[iu]
+    vals = vals[np.isfinite(vals)]
+    return float(vals.mean()) if vals.size else float("nan")
+
+
+def _random_internal_mean(
+    clr: cooler.Cooler,
+    chrom: str,
+    length_bp: int,
+    *,
+    n_samples: int = 200,
+    seed: int = 42,
+    cache: dict | None = None,
+    diag_k: int = 1,
+) -> float:
+    """Mean internal contact of random equal-length windows on chrom."""
+    length_bp = int(length_bp)
+    chrom_size = int(clr.chromsizes[chrom])
+    res = int(clr.binsize)
+    # snap length to bins so cache keys stay coarse
+    length_bp = max(2 * res, int(round(length_bp / res)) * res)
+    key = (str(chrom), length_bp, res, int(n_samples), int(diag_k))
+    if cache is not None and key in cache:
+        return float(cache[key])
+    if chrom_size <= length_bp:
+        return float("nan")
+    rng = np.random.default_rng(int(seed) + length_bp)
+    means: list[float] = []
+    # try a few extras in case of empty/NaN fetches
+    for _ in range(max(int(n_samples) * 2, int(n_samples))):
+        if len(means) >= int(n_samples):
+            break
+        s = int(rng.integers(0, chrom_size - length_bp))
+        v = _interval_internal_mean(clr, chrom, s, s + length_bp, diag_k=diag_k)
+        if np.isfinite(v):
+            means.append(v)
+    out = float(np.mean(means)) if means else float("nan")
+    if cache is not None:
+        cache[key] = out
+    return out
+
+
+def filter_tra_weak_internal(
+    merged: pd.DataFrame,
+    mcool: Path | str,
+    *,
+    min_frac: float = 1.0 / 3.0,
+    n_random: int = 200,
+    seed: int = 42,
+    quiet: bool = False,
+) -> pd.DataFrame:
+    """Drop TRA if insert or partner internal signal < min_frac × random mean.
+
+    Internal = mean off-diagonal contacts inside the interval. Random baseline =
+    mean internal signal of equal-length windows on the same chromosome.
+    Filtered calls must not enter ALL_TRA / scoring.
+    """
+    if merged is None or len(merged) == 0:
+        return merged if merged is not None else empty_tra_table()
+    mcool = Path(mcool)
+    available = discover_resolutions(mcool)
+    if not available:
+        return merged
+    cache: dict = {}
+    coolers: dict[int, cooler.Cooler] = {}
+    keep = []
+    n_drop = 0
+    for _, row in merged.iterrows():
+        chrom = str(row["chrom"])
+        s0, s1 = int(row["start"]), int(row["end"])
+        p0, p1 = int(row["partner_start"]), int(row["partner_end"])
+        # prefer call's finest listed resolution
+        use_res = available[0]
+        if "resolutions" in row.index and pd.notna(row.get("resolutions")):
+            parts = [
+                int(float(x))
+                for x in str(row["resolutions"]).split(",")
+                if str(x).strip()
+            ]
+            parts = [r for r in parts if r in available]
+            if parts:
+                use_res = min(parts)
+        if use_res not in coolers:
+            coolers[use_res] = cooler.Cooler(f"{mcool}::/resolutions/{use_res}")
+        clr = coolers[use_res]
+        if chrom not in clr.chromnames:
+            keep.append(True)
+            continue
+        ins_obs = _interval_internal_mean(clr, chrom, s0, s1)
+        par_obs = _interval_internal_mean(clr, chrom, p0, p1)
+        ins_bg = _random_internal_mean(
+            clr, chrom, s1 - s0, n_samples=n_random, seed=seed, cache=cache
+        )
+        par_bg = _random_internal_mean(
+            clr, chrom, p1 - p0, n_samples=n_random, seed=seed, cache=cache
+        )
+        thr_ins = float(ins_bg) * float(min_frac) if np.isfinite(ins_bg) else float("nan")
+        thr_par = float(par_bg) * float(min_frac) if np.isfinite(par_bg) else float("nan")
+        bad_ins = np.isfinite(ins_obs) and np.isfinite(thr_ins) and ins_obs < thr_ins
+        bad_par = np.isfinite(par_obs) and np.isfinite(thr_par) and par_obs < thr_par
+        if bad_ins or bad_par:
+            n_drop += 1
+            keep.append(False)
+            if not quiet:
+                print(
+                    f"[FILTER] drop TRA {chrom}:{s0}-{s1} "
+                    f"(internal insert={ins_obs:.4g}/{ins_bg:.4g} "
+                    f"partner={par_obs:.4g}/{par_bg:.4g}; "
+                    f"need ≥{min_frac:g}× random)",
+                    flush=True,
+                )
+        else:
+            keep.append(True)
+    out = merged.loc[keep].reset_index(drop=True)
+    if len(out) and "cluster_id" in out.columns:
+        out["cluster_id"] = np.arange(1, len(out) + 1, dtype=int)
+    if n_drop and not quiet:
+        print(
+            f"[INFO] internal-signal gate: dropped {n_drop} TRA "
+            f"(insert|partner < {min_frac:g}× random equal-length intra)",
+            flush=True,
+        )
+    return out
 
 
 def iterate_clear_insert(
@@ -1652,7 +1880,7 @@ def iterate_clear_insert(
                 all_mutual.append(rec)
             n_pairs = sum(1 for r in mutual_recs if r.get("mutual_decision") == "keep") // 2
             print(
-                f"[round {rnd}] mutual={n_pairs} pairs (both sides kept) "
+                f"[round {rnd}] mutual={n_pairs} pairs (shorter arm kept later) "
                 f"(randomly keep one side)",
                 flush=True,
             )
@@ -2226,6 +2454,418 @@ def plot_resolution_community(
     print(f"[INFO] wrote {out_path}", flush=True)
 
 
+def tra_plot_window(
+    start: int,
+    end: int,
+    partner_start: int,
+    partner_end: int,
+    chrom_size: int,
+    flank: int = 2_000_000,
+) -> tuple[int, int]:
+    """Window covering insert + partner with flanks (for local TRA plots)."""
+    left = min(int(start), int(partner_start))
+    right = max(int(end), int(partner_end))
+    ws = max(0, left - int(flank))
+    we = min(int(chrom_size), right + int(flank))
+    if we <= ws:
+        we = min(int(chrom_size), ws + max(right - left, 1))
+    return ws, we
+
+
+# ponytail: self-check for window math (ceiling: flank/chrom clamps)
+assert tra_plot_window(10, 20, 100, 110, 200, flank=5) == (5, 115)
+assert tra_plot_window(0, 10, 5, 15, 20, flank=100) == (0, 20)
+
+
+def _mark_tra_on_hic(ax, s: float, e: float, p0: float, p1: float, face: str = "#2ca02c") -> None:
+    """Solid=insert, dashed=partner, off-diagonal contact boxes."""
+    ax.add_patch(
+        plt.Rectangle(
+            (s, s),
+            max(0.05, e - s),
+            max(0.05, e - s),
+            fill=False,
+            edgecolor=face,
+            lw=1.8,
+        )
+    )
+    ax.add_patch(
+        plt.Rectangle(
+            (p0, p0),
+            max(0.05, p1 - p0),
+            max(0.05, p1 - p0),
+            fill=False,
+            edgecolor=face,
+            lw=1.2,
+            linestyle="--",
+        )
+    )
+    ax.add_patch(
+        plt.Rectangle(
+            (p0, s),
+            max(0.05, p1 - p0),
+            max(0.05, e - s),
+            fill=False,
+            edgecolor=face,
+            lw=1.0,
+            linestyle=":",
+        )
+    )
+    ax.add_patch(
+        plt.Rectangle(
+            (s, p0),
+            max(0.05, e - s),
+            max(0.05, p1 - p0),
+            fill=False,
+            edgecolor=face,
+            lw=1.0,
+            linestyle=":",
+        )
+    )
+
+
+_TRA_ARM_COLORS = ("#2ca02c", "#ff7f0e", "#1f77b4", "#d62728", "#9467bd")
+
+
+def group_abutting_tra_calls(
+    calls: pd.DataFrame, abut_slack: int = 500_000
+) -> list[pd.DataFrame]:
+    """Group same-chrom TRA calls whose insert intervals abut/overlap.
+
+    Reciprocal intra-TRA often yields two abutting insert arms (A B C D →
+    A C B D); plot/report them as one event.
+    """
+    if calls is None or len(calls) == 0:
+        return []
+    df = calls.reset_index(drop=True)
+    n = len(df)
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if str(df.at[i, "chrom"]) != str(df.at[j, "chrom"]):
+                continue
+            if _calls_abut(
+                int(df.at[i, "start"]),
+                int(df.at[i, "end"]),
+                int(df.at[j, "start"]),
+                int(df.at[j, "end"]),
+                slack=abut_slack,
+            ):
+                union(i, j)
+    groups: dict[int, list[int]] = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+    out = []
+    for idxs in groups.values():
+        g = df.iloc[sorted(idxs)].reset_index(drop=True)
+        # stable: primary arm = highest scale_support then enrichment
+        if "scale_support" in g.columns:
+            g = g.sort_values(
+                by=[c for c in ("scale_support", "enrichment_fold", "size") if c in g.columns],
+                ascending=False,
+            ).reset_index(drop=True)
+        out.append(g)
+    out.sort(key=lambda g: (str(g.at[0, "chrom"]), int(g.at[0, "start"])))
+    return out
+
+
+def plot_tra_event(
+    mcool: Path,
+    chrom: str,
+    chrom_size: int,
+    resolution: int,
+    segments: pd.DataFrame,
+    call: pd.Series | pd.DataFrame,
+    out_path: Path,
+    plot_res: int | None = None,
+    flank: int = 2_000_000,
+) -> None:
+    """One TRA event (1+ abutting arms): zoomed community + Hi-C, marked."""
+    if isinstance(call, pd.DataFrame):
+        arms = call.reset_index(drop=True)
+    else:
+        arms = pd.DataFrame([call])
+    coords: list[int] = []
+    for _, r in arms.iterrows():
+        coords.extend(
+            [
+                int(r["start"]),
+                int(r["end"]),
+                int(r["partner_start"]),
+                int(r["partner_end"]),
+            ]
+        )
+    left, right = min(coords), max(coords)
+    ws, we = tra_plot_window(left, right, left, right, chrom_size, flank=flank)
+    ws_mb, we_mb = ws / 1e6, we / 1e6
+
+    available = discover_resolutions(mcool)
+    if plot_res is None or plot_res not in available:
+        span = max(we - ws, 1)
+        candidates = [r for r in available if 8 <= int(math.ceil(span / r)) <= 1200]
+        plot_res = (
+            min(candidates, key=lambda r: abs(int(math.ceil(span / r)) - 500))
+            if candidates
+            else max(available)
+        )
+    clr = cooler.Cooler(f"{mcool}::/resolutions/{plot_res}")
+    matrix = np.asarray(
+        clr.matrix(balance=False).fetch((chrom, ws, we)), dtype=float
+    )
+    positive = matrix[np.isfinite(matrix) & (matrix > 0)]
+
+    fig, axes = plt.subplots(
+        1, 2, figsize=(16, 7), gridspec_kw={"width_ratios": [1.2, 2.2]}
+    )
+    ax = axes[0]
+    ymax = 1.0
+    if len(segments):
+        ymax = float(segments["label"].max())
+        for _, segment in segments.iterrows():
+            seg_s = int(segment["start_bin"]) * resolution / 1e6
+            seg_e = min(int(segment["end_bin"]) * resolution, chrom_size) / 1e6
+            if seg_e <= ws_mb or seg_s >= we_mb:
+                continue
+            if bool(segment.get("is_filtered", False)):
+                color, lw, alpha = "lightgray", 1.5, 0.45
+            elif bool(segment.get("is_candidate", False)):
+                color, lw, alpha = "red", 4.0, 0.95
+            else:
+                color, lw, alpha = "royalblue", 3.0, 0.85
+            lab = int(segment["label"])
+            ax.plot(
+                [max(seg_s, ws_mb), min(seg_e, we_mb)],
+                [lab, lab],
+                color=color,
+                linewidth=lw,
+                alpha=alpha,
+                solid_capstyle="butt",
+                zorder=1,
+            )
+    fold_bits = []
+    for i, (_, arm) in enumerate(arms.iterrows()):
+        face = _TRA_ARM_COLORS[i % len(_TRA_ARM_COLORS)]
+        s_mb, e_mb = int(arm["start"]) / 1e6, int(arm["end"]) / 1e6
+        p0_mb, p1_mb = int(arm["partner_start"]) / 1e6, int(arm["partner_end"]) / 1e6
+        cid = int(arm.get("cluster_id", i + 1))
+        ax.axvspan(s_mb, e_mb, color=face, alpha=0.22, zorder=0)
+        ax.axvspan(p0_mb, p1_mb, color=face, alpha=0.12, zorder=0)
+        ax.annotate(
+            f"ins{cid}",
+            xy=(0.5 * (s_mb + e_mb), ymax * 0.98),
+            xytext=(0.5 * (s_mb + e_mb), ymax * (1.08 + 0.06 * i)),
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            color=face,
+            fontweight="bold",
+            arrowprops=dict(arrowstyle="-", color=face, lw=0.8),
+            clip_on=False,
+        )
+        ax.annotate(
+            f"par{cid}",
+            xy=(0.5 * (p0_mb + p1_mb), ymax * 0.98),
+            xytext=(0.5 * (p0_mb + p1_mb), ymax * (1.08 + 0.06 * i)),
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            color=face,
+            fontweight="bold",
+            arrowprops=dict(arrowstyle="-", color=face, lw=0.8),
+            clip_on=False,
+        )
+        try:
+            fold = float(arm.get("enrichment_fold", np.nan))
+            fold_bits.append(f"c{cid}:{fold:.2f}" if np.isfinite(fold) else f"c{cid}:NA")
+        except (TypeError, ValueError):
+            fold_bits.append(f"c{cid}:NA")
+    ax.set_xlim(ws_mb, we_mb)
+    ax.set_ylim(-2, ymax * (1.14 + 0.06 * max(0, len(arms) - 1)))
+    ax.set_xlabel("Genomic position (Mb)")
+    ax.set_ylabel("Community cluster")
+    primary = arms.iloc[0]
+    eid = int(primary.get("cluster_id", 1))
+    ax.set_title(
+        f"Community ({resolution/1000:g} kb)  TRA event "
+        f"({len(arms)} arm{'s' if len(arms) != 1 else ''})\n"
+        f"solid span=insert  wash=partner  fold={', '.join(fold_bits)}"
+    )
+    ax.grid(True, axis="x", alpha=0.3)
+
+    ax = axes[1]
+    if positive.size:
+        vmin = max(float(np.quantile(positive, 0.05)), np.finfo(float).tiny)
+        vmax = max(float(np.quantile(positive, 0.995)), vmin * 1.01)
+        shown = np.ma.masked_invalid(np.ma.masked_less_equal(matrix, 0))
+        ax.imshow(
+            shown,
+            cmap="Reds",
+            norm=LogNorm(vmin=vmin, vmax=vmax),
+            extent=[ws_mb, we_mb, we_mb, ws_mb],
+            interpolation="nearest",
+        )
+    else:
+        ax.imshow(matrix, cmap="Reds", extent=[ws_mb, we_mb, we_mb, ws_mb])
+    for i, (_, arm) in enumerate(arms.iterrows()):
+        face = _TRA_ARM_COLORS[i % len(_TRA_ARM_COLORS)]
+        _mark_tra_on_hic(
+            ax,
+            int(arm["start"]) / 1e6,
+            int(arm["end"]) / 1e6,
+            int(arm["partner_start"]) / 1e6,
+            int(arm["partner_end"]) / 1e6,
+            face=face,
+        )
+    ax.set_xlim(ws_mb, we_mb)
+    ax.set_ylim(we_mb, ws_mb)
+    ax.set_xlabel("Mb")
+    ax.set_ylabel("Mb")
+    ax.set_title(
+        f"{chrom} local Hi-C ({plot_res/1000:g} kb)\n"
+        "solid=insert  dashed=partner  dotted=cross"
+    )
+    arm_txt = "; ".join(
+        f"c{int(a.get('cluster_id', i+1))} "
+        f"{int(a['start'])/1e6:.2f}–{int(a['end'])/1e6:.2f}↔"
+        f"{int(a['partner_start'])/1e6:.2f}–{int(a['partner_end'])/1e6:.2f}"
+        for i, (_, a) in enumerate(arms.iterrows())
+    )
+    fig.suptitle(
+        f"TRA{eid:04d} event | {chrom}  ({len(arms)} arm{'s' if len(arms) != 1 else ''})\n"
+        f"{arm_txt}",
+        fontsize=12,
+        y=0.98,
+    )
+    fig.tight_layout(rect=[0.01, 0.01, 0.99, 0.90])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[INFO] wrote {out_path}", flush=True)
+
+
+def _parse_call_res_gamma(call: pd.Series) -> tuple[int | None, float | None]:
+    """Best (resolution, gamma) hint from a merged TRA row."""
+    res = None
+    gamma = None
+    if "resolutions" in call.index and pd.notna(call["resolutions"]):
+        parts = [p.strip() for p in str(call["resolutions"]).split(",") if p.strip()]
+        if parts:
+            try:
+                res = int(float(parts[0]))
+            except ValueError:
+                res = None
+    if "gammas" in call.index and pd.notna(call["gammas"]):
+        parts = [p.strip() for p in str(call["gammas"]).split(",") if p.strip()]
+        if parts:
+            try:
+                gamma = float(parts[0])
+            except ValueError:
+                gamma = None
+    # member_resolutions like 50000_g0.75:c1;...
+    if (res is None or gamma is None) and "member_resolutions" in call.index:
+        mem = str(call.get("member_resolutions", "") or "")
+        m = re.search(r"(\d+)_g([0-9.]+)", mem)
+        if m:
+            if res is None:
+                res = int(m.group(1))
+            if gamma is None:
+                gamma = float(m.group(2))
+    return res, gamma
+
+
+def plot_merged_tra_events(
+    mcool: Path,
+    chrom: str,
+    chrom_size: int,
+    merged: pd.DataFrame,
+    segments_cache: dict[tuple[int, float], pd.DataFrame],
+    outdir: Path,
+    edge_quantile: float = 0.9,
+    seed: int = 42,
+    min_segment_bp: int = 500_000,
+    bridge_bp: int = 500_000,
+) -> list[Path]:
+    """Write one community+HiC figure per TRA *event* under outdir/HiC_TRA_Local/.
+
+    Abutting insert arms on the same chrom (reciprocal TRA) share one figure.
+    """
+    if merged is None or len(merged) == 0:
+        return []
+    hic_dir = outdir / "HiC_TRA_Local"
+    hic_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    available = discover_resolutions(mcool)
+
+    for arms in group_abutting_tra_calls(merged):
+        primary = arms.iloc[0]
+        want_res, want_g = _parse_call_res_gamma(primary)
+        segments = pd.DataFrame()
+        use_res = want_res if want_res in available else (
+            min(available, key=lambda r: abs(r - (want_res or 100_000)))
+        )
+        if want_g is not None and (use_res, float(want_g)) in segments_cache:
+            segments = segments_cache[(use_res, float(want_g))]
+        else:
+            alts = [(r, g) for (r, g) in segments_cache if r == use_res]
+            if alts:
+                use_g = sorted(alts, key=lambda rg: abs(rg[1] - (want_g or 1.0)))[0][1]
+                segments = segments_cache[(use_res, use_g)]
+            else:
+                use_g = float(want_g) if want_g is not None else 1.0
+                try:
+                    _, _, _, _, _, segments = analyze_scale(
+                        mcool,
+                        chrom,
+                        chrom_size,
+                        use_res,
+                        use_g,
+                        edge_quantile,
+                        False,
+                        seed,
+                        min_segment_bp,
+                        bridge_bp,
+                        networkit_threads=1,
+                        plm_par="balanced",
+                    )
+                    segments_cache[(use_res, use_g)] = segments
+                except Exception as exc:  # pragma: no cover - plot best-effort
+                    print(f"[WARN] TRA event community failed: {exc}", flush=True)
+                    segments = pd.DataFrame()
+
+        cid = int(primary.get("cluster_id", len(written) + 1))
+        start = int(arms["start"].min())
+        end = int(arms["end"].max())
+        tag = "event" if len(arms) > 1 else f"{start}_{end}"
+        out_path = (
+            hic_dir / f"TRA{cid:04d}_{chrom}_{tag}.png"
+            if len(arms) > 1
+            else hic_dir / f"TRA{cid:04d}_{chrom}_{start}_{end}.png"
+        )
+        plot_tra_event(
+            mcool,
+            chrom,
+            chrom_size,
+            use_res,
+            segments if segments is not None else pd.DataFrame(),
+            arms,
+            out_path,
+        )
+        written.append(out_path)
+    return written
+
+
 def _calls_abut(a0: int, a1: int, b0: int, b1: int, slack: int = 500_000) -> bool:
     """True if intervals touch or nearly touch (reciprocal TRA neighbors)."""
     if a1 <= b0:
@@ -2233,6 +2873,22 @@ def _calls_abut(a0: int, a1: int, b0: int, b1: int, slack: int = 500_000) -> boo
     if b1 <= a0:
         return (a0 - b1) <= slack
     return _overlap(a0, a1, b0, b1) > 0
+
+
+# ponytail: abutting inserts → one event; keep shorter arm (ceiling: slack=500kb)
+assert len(group_abutting_tra_calls(pd.DataFrame([
+    {"chrom": "chrX", "start": 100, "end": 200, "scale_support": 2},
+    {"chrom": "chrX", "start": 200, "end": 300, "scale_support": 1},
+    {"chrom": "chrX", "start": 10_000_000, "end": 10_100_000, "scale_support": 1},
+]))) == 2
+_ks = keep_shorter_reciprocal_tra(pd.DataFrame([
+    {"chrom": "chrX", "start": 100, "end": 200, "partner_start": 500, "partner_end": 600,
+     "enrichment_fold": 3.0, "scale_support": 2, "cluster_id": 1, "mutual_pair_id": 0},
+    {"chrom": "chrX", "start": 200, "end": 500, "partner_start": 50, "partner_end": 90,
+     "enrichment_fold": 2.0, "scale_support": 1, "cluster_id": 2, "mutual_pair_id": 0},
+]), quiet=True)
+assert len(_ks) == 1 and int(_ks.iloc[0]["start"]) == 100 and int(_ks.iloc[0]["end"]) == 200
+del _ks
 
 
 def evaluate_against_truth(calls: pd.DataFrame, truth: pd.DataFrame, thr: float = 0.5):
@@ -2682,6 +3338,7 @@ def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
 
     # stable order for logs / merge
     results.sort(key=lambda r: (int(r["resolution"]), float(r["gamma"])))
+    segments_cache: dict[tuple[int, float], pd.DataFrame] = {}
     for result in results:
         print(result.get("log", ""), flush=True)
         if result.get("empty"):
@@ -2691,6 +3348,9 @@ def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
         out = result["out"]
         true_tables[(res, gamma)] = out
         summary_rows.append(result["summary"])
+        segs = result.get("segments", pd.DataFrame())
+        if segs is not None and len(segs):
+            segments_cache[(res, gamma)] = segs
         if result.get("cands") is not None and len(result["cands"]):
             all_cands_frames.append(result["cands"])
         if result.get("mutual_recs"):
@@ -2703,7 +3363,7 @@ def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
                 args.chrom,
                 chrom_size,
                 res,
-                result.get("segments", pd.DataFrame()),
+                segs if segs is not None else pd.DataFrame(),
                 tr,
                 truth,
                 community_dir / f"community_opt_{args.chrom}_{tag}.png",
@@ -2723,7 +3383,8 @@ def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
         )
         if len(recovered):
             print(
-                f"[INFO] mutual recover both sides: {len(recovered)} calls",
+                f"[INFO] mutual recover mates: {len(recovered)} calls "
+                f"(shorter arm kept later)",
                 flush=True,
             )
             # numeric key so merge_true_across_resolutions sort stays valid
@@ -2743,7 +3404,7 @@ def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
         if n_mutual:
             print(
                 f"[INFO] mutual-insert marked: {n_mutual} calls "
-                f"({n_pairs} pairs; both sides kept)",
+                f"({n_pairs} pairs; shorter arm kept after enrichment gate)",
                 flush=True,
             )
     merged_path = args.outdir / "merged_true_calls.tsv"
@@ -2759,6 +3420,10 @@ def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
             min_enrichment_fold=float(getattr(args, "min_enrichment_fold", 1.5)),
             outdir=args.outdir,
         )
+        # Reciprocal mutual-insert: keep shorter arm only
+        merged = keep_shorter_reciprocal_tra(merged)
+        # Weak internal Hi-C (insert or partner) vs random equal-length
+        merged = filter_tra_weak_internal(merged, args.mcool)
     else:
         merged = empty_tra_table()
         # Keep audit tables well-formed for downstream merge / empty chroms.
@@ -2777,6 +3442,22 @@ def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
         merged.to_csv(pre_path, sep="\t", index=False)
     print(f"\n[INFO] merged true calls: {len(merged)} -> {merged_path}", flush=True)
     print(f"[INFO] ALL_TRA.tsv -> {tra_path}", flush=True)
+
+    # Final TRA calls: zoomed community + Hi-C on one figure (marked).
+    if len(merged) and not args.skip_plot:
+        written = plot_merged_tra_events(
+            args.mcool,
+            args.chrom,
+            chrom_size,
+            merged,
+            segments_cache,
+            args.outdir,
+            edge_quantile=float(args.edge_quantile),
+            seed=int(args.seed),
+            min_segment_bp=int(args.min_segment_bp),
+            bridge_bp=int(args.bridge_bp),
+        )
+        print(f"[INFO] TRA event plots: {len(written)} -> {args.outdir / 'HiC_TRA_Local'}", flush=True)
 
     if len(merged) and args.truth is not None:
         mev = evaluate_against_truth(merged, truth)

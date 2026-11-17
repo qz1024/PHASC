@@ -16,7 +16,7 @@ Inversion
   - Merge overlapping seeds per chrom, then post-merge flip gate matching
     multiscale_inversion.apply_post_merge_flip_gate: flank=|S|, keep only
     intervals with ≥ --inv-min-pos-scales (default 2) resolutions where
-    Δflip > flip_min
+    Δflip > flip_min AND mean Δflip across finite resolutions > flip_min
   - Penalty = sum over kept events of clip(max(0,mean_Δflip)/2)·length_bp
 
 Intra-chromosomal translocation
@@ -39,7 +39,7 @@ Score (genome-size normalized)
     INV + TRA penalties are added (combined damage), not averaged.
   - Component scores 100×(1−D') are INV-only / TRA-only views for audit.
   - Higher QV ⇒ higher structural quality
-  - Default --penalty-scale 25,12; use 1 for unscaled D.
+  - Default --penalty-scale 5000,500; use 1 for unscaled D.
 
 Dependencies: cooler, numpy, scipy, pandas, networkx;
 optional networkit (preferred for TRA clustering, matches detector).
@@ -554,7 +554,8 @@ def gate_inv_events_multiscale_flip(
     """Apply detector-style post-merge flip gate to positive community seeds.
 
     Matches multiscale_inversion.apply_post_merge_flip_gate:
-    flank=|S|, keep only if ≥ min_pos_scales resolutions have Δflip > flip_min.
+    flank=|S|, gate on 50/100/200 kb only; keep if ≥ min_pos_scales have
+    Δflip > flip_min and mean Δflip > flip_min.
 
     Returns (D_inv, raw_sum_mean_positive_flip, flip_per_mb, event_table).
     D_inv = Σ_kept (bounded · length_bp) / genome_bp  (event counted once).
@@ -570,7 +571,11 @@ def gate_inv_events_multiscale_flip(
     if pos.empty:
         return 0.0, 0.0, 0.0, empty
 
-    res_list = [int(r) for r in resolutions]
+    # Align with detector: ignore 500 kb in the flip gate.
+    _gate = {50_000, 100_000, 200_000}
+    res_list = [int(r) for r in resolutions if int(r) in _gate]
+    if not res_list:
+        res_list = [50_000, 100_000, 200_000]
     genome_bp = int(pos["chrom_length_bp"].max()) if "chrom_length_bp" in pos else 0
     # Prefer full-genome size from first resolution cooler when available.
     try:
@@ -636,7 +641,8 @@ def gate_inv_events_multiscale_flip(
                 )
                 for r in res_list
             )
-            passed = int(n_pos >= int(min_pos_scales))
+            mean_ok = bool(np.isfinite(mean_d) and float(mean_d) > float(flip_min))
+            passed = int(n_pos >= int(min_pos_scales) and mean_ok)
             if passed:
                 bounded = float(np.clip(mean_pos / 2.0, 0.0, 1.0))
                 weighted_penalty_sum += bounded * float(length_bp)
@@ -669,8 +675,10 @@ def gate_inv_events_multiscale_flip(
     n_keep = int(event_df["flip_pass"].sum()) if not event_df.empty else 0
     LOG.info(
         "INV flip gate: seeds=%d events=%d kept=%d dropped=%d "
-        "(need >=%d scales with Δflip > %g, flank=|S|)",
-        n_seed, len(events), n_keep, n_drop, int(min_pos_scales), float(flip_min),
+        "(50/100/200kb: need >=%d scales with Δflip > %g and mean > %g; "
+        "flank=|S|)",
+        n_seed, len(events), n_keep, n_drop,
+        int(min_pos_scales), float(flip_min), float(flip_min),
     )
     return d_inv, raw_sum, flip_per_mb, event_df
 
@@ -1101,7 +1109,11 @@ def _genome_bp_from_mcool(
 
 
 def _inv_penalty_from_calls(inv_df: pd.DataFrame) -> Tuple[float, float, pd.DataFrame]:
-    """D numerator pieces from detector INV table (already flip-gated)."""
+    """D numerator pieces from detector INV table (already flip-gated).
+
+    Drop rows whose mean flip_improve is missing or ≤ 0 (same mean>0 rule
+    as detection / evaluate flip gate), even if an older TSV kept them.
+    """
     if inv_df is None or inv_df.empty:
         return 0.0, 0.0, pd.DataFrame()
     rows = []
@@ -1115,9 +1127,9 @@ def _inv_penalty_from_calls(inv_df: pd.DataFrame) -> Tuple[float, float, pd.Data
         else:
             length_bp = max(0, end - start)
         flip = float(r["flip_improve"]) if "flip_improve" in r.index and pd.notna(r.get("flip_improve")) else 0.0
-        if not np.isfinite(flip):
-            flip = 0.0
-        pos = float(max(0.0, flip))
+        if not np.isfinite(flip) or float(flip) <= 0.0:
+            continue
+        pos = float(flip)
         bounded = float(np.clip(pos / 2.0, 0.0, 1.0))
         weighted += bounded * float(length_bp)
         raw += pos
@@ -1166,7 +1178,7 @@ def score_sci_from_calls(
     inv_tsv: str | Path | None = None,
     tra_tsv: str | Path | None = None,
     weights: Sequence[float] = (1.0, 1.0),
-    penalty_scale: str | Sequence[float] = "25,12",
+    penalty_scale: str | Sequence[float] = "5000,500",
     chromosomes: Optional[Sequence[str]] = None,
     skip_inversion: bool = False,
     skip_translocation: bool = False,
@@ -1249,7 +1261,7 @@ def score_sci_from_calls(
         "total_score_0_100": total_score,
         "interpretation": (
             "From pipeline call tables only (no re-detection). "
-            "D_inv from ALL_INV flip_improve; D_tra from ALL_TRA enrichment_fold; "
+            "D_inv from ALL_INV flip_improve (skip ≤0); D_tra from ALL_TRA enrichment_fold; "
             "score = 100×(1 − weighted scaled D)."
         ),
     }
@@ -1327,6 +1339,13 @@ def _self_check() -> int:
     }])
     w1, s1, e1 = _inv_penalty_from_calls(inv)
     assert abs(w1 - 0.5 * 2_000_000) < 1e-6 and len(e1) == 1 and s1 == 1.0
+    # mean flip_improve ≤ 0 must not enter SCI penalty
+    inv_neg = pd.DataFrame([{
+        "chrom": "chr1", "start": 0, "end": 1_000_000, "size": 1_000_000,
+        "flip_improve": -0.083,
+    }])
+    wn, sn, en = _inv_penalty_from_calls(inv_neg)
+    assert wn == 0.0 and sn == 0.0 and en.empty
     tra = pd.DataFrame([{
         "chrom": "chr1", "start": 0, "end": 1_000_000, "size": 1_000_000,
         "enrichment_fold": 2.0,
@@ -1385,8 +1404,8 @@ def main() -> int:
         default=2,
         help=(
             "Post-merge flip gate: keep event only if ≥ this many resolutions "
-            "have Δflip > --inv-flip-min with flank=|S| (default 2; matches "
-            "detector --flip-min-pos-scales)"
+            "have Δflip > --inv-flip-min AND mean Δflip > --inv-flip-min "
+            "with flank=|S| (default 2; matches detector --flip-min-pos-scales)"
         ),
     )
     parser.add_argument("--edge-quantile", type=float, default=TRA_EDGE_QUANTILE_DEFAULT,
@@ -1429,10 +1448,10 @@ def main() -> int:
                         help="Weights for inversion,translocation (default equal)")
     parser.add_argument(
         "--penalty-scale",
-        default="25,12",
+        default="5000,500",
         help=(
             "Amplify genome-normalized D before scoring: one value (shared) or "
-            "inv,tra pair. score uses clip(scale·D). Default 25,12 (INV needs "
+            "inv,tra pair. score uses clip(scale·D). Default 5000,500 (INV needs "
             "a larger boost because genome averaging makes D_inv tiny); use 1 "
             "for legacy unscaled scoring."
         ),
@@ -1591,7 +1610,8 @@ def main() -> int:
             "interpretation": (
                 "Higher score = higher structural quality. "
                 "D_inv = Σ_event(bounded·length)/genome_bp after "
-                "multiscale flip gate (≥inv_min_pos_scales scales, flank=|S|); "
+                "multiscale flip gate (≥inv_min_pos_scales scales with "
+                "Δflip>min and mean Δflip>min, flank=|S|); "
                 "D_tra = Σ_call clip(1−1/fold)·length/genome_bp after the "
                 "intra-TRA detector enrichment gate; "
                 "both genome-size normalized. "
